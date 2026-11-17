@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-11-17",
+  "automatic_download": false,
+  "note": "Assets are deliberately not included in Git. Restore from the validated local project; calibration is hardware-specific.",
+  "assets": [
+    {
+      "path": "mobileclip2_b.ts",
+      "size_bytes": 253794476,
+      "sha256": "35d7f213e4d75f38514e4656ad3cb91158bd33e3805d8ac349f23b186f66982f",
+      "required_for": "YOLOE text encoder"
+    },
+    {
+      "path": "models/261104_my_rapidocr_torch/PP-OCRv6_rec_small.pth",
+      "size_bytes": 21326017,
+      "sha256": "0107b2ad694ccc9b1db7cf9ed3ffbc93d1795d9e08d9cf823127243a87bce516",
+      "required_for": "OCR recognition"
+    },
+    {
+      "path": "models/261104_my_rapidocr_torch/ppocrv6_dict.txt",
+      "size_bytes": 74947,
+      "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+      "required_for": "OCR recognition"
+    },
+    {
+      "path": "models/yolo11n.pt",
+      "size_bytes": 5613764,
+      "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+      "required_for": "optional upstream demo"
+    },
+    {
+      "path": "models/yoloe-26l-seg.pt",
+      "size_bytes": 79417413,
+      "sha256": "a612d2d505f24e14d87ec82d688b823b6cb600646664f16125ce6c84ce360da9",
+      "required_for": "default detector"
+    },
+    {
+      "path": "models/yoloe-26s-seg.pt",
+      "size_bytes": 30759531,
+      "sha256": "6f62bc7ed9f86056112c383e9b85023291a3929086af26b1a8762335fe39a17d",
+      "required_for": "optional upstream demo"
+    },
+    {
+      "path": "models/yolov8s-world.pt",
+      "size_bytes": 27169314,
+      "sha256": "095f5266bb9b654bd5ad9e21e9cdeda78e0f2c8460f5d652eaf04bab7ee251cf",
+      "required_for": "optional upstream demo"
+    },
+    {
+      "path": "config/calibration/orbbec_gemini2/intrinsics.npz",
+      "size_bytes": 906,
+      "sha256": "68058ac38dc8e60f70db87e4b854bebfd236bca11b53d291c9b3e8a5b045de2d",
+      "required_for": "calibration: original matching hardware only"
+    },
+    {
+      "path": "config/calibration/realsense_d405/hand_eye.npz",
+      "size_bytes": 1200,
+      "sha256": "e7c07f6040163949d042c5ccfa4d261c10b5dd922dd68f701e57a5837acfd14b",
+      "required_for": "calibration: original matching hardware only"
+    },
+    {
+      "path": "config/calibration/realsense_d405/intrinsics.npz",
+      "size_bytes": 906,
+      "sha256": "e3ace8435bc7ed1253c98c81ff07365ac61caf8d4caf5fadbca7ec2150a3d0be",
+      "required_for": "calibration: original matching hardware only"
+    },
+    {
+      "path": "config/calibration/realsense_d435i/intrinsics.npz",
+      "size_bytes": 906,
+      "sha256": "bfc96dd712c766d2c50dac15714928de4dadcfc1d1f377c1bbf5b2f44944220c",
+      "required_for": "calibration: original matching hardware only"
+    }
+  ]
+}

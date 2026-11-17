@@ -1,0 +1,22 @@
+{
+  "snapshot_date": "2026-11-17",
+  "unit_tests": {
+    "count": 460,
+    "passed": true,
+    "elapsed_s": 55.79,
+    "scope": "run from the clean export, not the original worktree"
+  },
+  "syntax_files": 86,
+  "simulations": {
+    "261113_my_elevator_journey": 0,
+    "261110_my_grasp_then_elevator": 0
+  },
+  "export_sdk_import_verified": true,
+  "missing_resource_check_exit_code": 2,
+  "missing_resource_check_expected": true,
+  "camera_or_robot_started": false,
+  "packages_installed_or_upgraded": false,
+  "fresh_environment_install_tested": false,
+  "models_and_machine_calibration_in_git": false,
+  "secret_pattern_findings": 0
+}

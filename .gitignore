@@ -1,0 +1,40 @@
+# Python / local environment
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+# Editor, credentials and host settings
+.vscode/
+.idea/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+.aws/
+.codex/
+.agents/
+# Separate runtime assets (see resources/runtime_assets.json)
+/models/*
+/mobileclip2_b.ts
+/config/calibration/**/*.npz
+/sdk/graspnet-baseline/
+# Logs, captures, experiments and packages
+*.log
+/Log/
+/data/
+/outputs/
+/runs/
+/delivery/
+/config/*_backup/
+*.zip
+*.tar
+*.tar.gz

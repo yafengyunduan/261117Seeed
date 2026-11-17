@@ -1,0 +1,25 @@
+{
+  "python": "3.10",
+  "packages": {
+    "numpy": "1.26.4",
+    "opencv-python": "4.7.0.72",
+    "opencv-contrib-python": "4.7.0.72",
+    "torch": "2.14.1",
+    "torchvision": "0.29.1",
+    "ultralytics": "8.4.35",
+    "pyrealsense2": "2.59.1.11053",
+    "pin": "3.9.0",
+    "rapidocr": "3.9.2",
+    "onnxruntime": "1.23.2",
+    "motorbridge": "0.5.6",
+    "PyYAML": "6.0.3",
+    "scipy": "1.15.2",
+    "pillow": "12.3.0",
+    "meshcat": "0.3.2",
+    "omegaconf": "2.3.1",
+    "shapely": "2.1.2",
+    "pyclipper": "1.4.0"
+  },
+  "note": "Observed working environment, not an installation recipe or a complete lockfile. The existing environment has two OpenCV distributions; do not reproduce that mixing in a new environment.",
+  "environment_modified": false
+}

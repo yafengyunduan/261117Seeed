@@ -1,0 +1,81 @@
+# 当前唯一电梯配置：原main.py同源SDK流程，2026-11-09精简。
+# 原始config/default.yaml、SDK、URDF、标定、模型权重均不修改。
+initial_poses:
+  # 1. 夹取预备位：base坐标系end_link位姿，XYZ单位米，roll/pitch/yaw单位弧度。
+  # duration为运动参考秒数。抓取完成返回预备位也使用此处。
+  grasp_ready:
+    x: 0.3
+    y: 0.0
+    z: 0.3
+    roll: 0.0
+    pitch: 0.7
+    yaw: 0.0
+    duration: 3.0
+  # 2. 外呼上下键初始视角：六轴绝对角度，单位度。
+  call_view_deg: [0, -25, -30, -10, 0, 0]
+  # 3. 轿内楼层按键初始视角：外呼结束后恢复此姿态，按C开始识别。
+  floor_view_deg: [0, -25, -50, -10, 0, 0]
+  # 4. LCD当前楼层识别初始视角：楼层按键结束后恢复此姿态。
+  display_view_deg: [0, -25, -60, -20, 0, 0]
+  # 上述三个视角只填前六轴；夹爪由gripper.closed_angle_deg统一设定。
+grasp_place:
+  # 261110串联入口和261113总流程：夹取成功后，将end_link移动到此处再松爪。
+  # base坐标系XYZ，单位米；不叠加视觉目标偏移。--place-xyz-m可临时覆盖。
+  xyz_m: [0.2, 0.2, 0.2]
+trajectory:
+  # 电梯与串联任务共用：SDK每0.1s求解一个IK点，关节插值后按原约0.01s发送。
+  # 3s轨迹31个求解点→301个发送点；不改变电机循环频率或动作参考时间。
+  # 设为0.01可恢复原求解密度；单独的原夹取模式不读取本配置。
+  sample_interval_s: 0.1
+ocr:
+  device: cuda
+  gpu_index: 0
+  model_dir: models/261104_my_rapidocr_torch
+  min_confidence: 0.70
+  # 两个主入口共用：先识别亮字，再补充黑字；bright可切回原亮字流程。
+  preprocessing: bright_dark
+temporal:
+  required: 3
+  memory_age_s: 10.0
+  memory_frames: 30
+startup_view:
+  # 三个识别初始视角在initial_poses中分别设置；此处仅共用运动时间与到位检查选项。
+  duration_s: 2
+  # false：下发后只等上述参考时间，不轮询七轴到位；true恢复到位检查。
+  wait_for_arrival: false
+gripper:
+  # 与六轴抬头同时下发POS_VEL闭合角，去掉先张开再闭合。
+  # 使用SDK原夹爪POS_VEL参数；抓取模式仍用原MIT/力控，不修改原配置。
+  initialize: true
+  # 用户2026-11-10复测：角度示例第七轴0度未闭合，+10度闭合。
+  # 是电梯阶段的电机绝对目标，不是编码器重标零；不影响原夹取力控。
+  # 仅第七轴硬件设零成功并复核后，必须改回0.0，不能叠加+10补偿。
+  closed_angle_deg: 0.0
+  # 相对上述闭合参考角的容差；不等于独立测量的实际夹缝。
+  closed_tolerance_rad: 0.01
+tool:
+  # 暂用值：2026-11-09用户补充，双指前端与URDF end_link是否重合尚未确认。
+  # 不把一次接近误差直接当作工具偏移或手眼补偿。
+  tip_offset_in_end_m: [0.0, 0.0, 0.0]
+elevator:
+  # 用户2026-11-09确认仍是打印面板；不追加压入，不声称验证实体按钮触发。
+  panel_type: printed
+  # 2026-11-10用户尺量后的电梯目标修正，base XYZ，单位米。
+  # X=100mm实测间隙-50mm预留，Y修正右偏23.5mm，Z修正下偏13.9mm。
+  # 在原手眼/base变换之后只加一次；不是工具偏移，不影响抓取模式。
+  target_offset_base_m: [0.028, 0.048, 0.0325]
+  standoff_m: 0.10
+  move_duration_s: 3.0
+  # 接近前置点时同步调平；false恢复原地调平后再平移。
+  level_during_approach: true
+  # 261113楼层按键：已确认楼层在当前阶段持续保留；新稳定识别更新/替换，换姿态或阶段清空。
+  # 当前圆环不必为绿色；执行前仍核对局部图像、深度和位姿。false恢复下方定时缓存。
+  floor_cache_until_update: true
+  # 外呼缓存及旧入口仍沿用此时间；上述开关为false时也控制261113楼层缓存。
+  stable_snapshot_age_s: 2.0
+  contact_duration_s: 1.5
+  retreat_duration_s: 2.0
+  dwell_s: 0.4
+  press_travel_m: 0.0
+  max_result_age_s: 4.0
+  floor_wait_s: 5.0
