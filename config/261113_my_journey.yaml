@@ -1,12 +1,8 @@
-# 新总流程的计时与识别参数；四个初始姿态统一在261105_my_elevator.yaml的initial_poses中设置。
-search_timeout_s: 10.0
+# 搜索等待、重试角度和四个初始姿态见 261105_my_elevator.yaml。
 settle_s: 0.3
 max_settle_s: 5.0
 arrival_timeout_s: 300.0
 max_observation_age_s: 0.8
-call_j3_retry_deg: [-15, -15]
-floor_j3_retry_deg: [-15, -15]
-display_j3_retry_deg: [-15, -10]
 # null：按用户确认，动态复用261105配置中的elevator.target_offset_base_m。
 # 如需外呼独立校准，可改成[x,y,z]；[0,0,0]明确表示不加目标修正。
 call_target_offset_base_m: null

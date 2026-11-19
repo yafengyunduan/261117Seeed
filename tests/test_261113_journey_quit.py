@@ -62,7 +62,7 @@ class QuitCallbackTests(unittest.TestCase):
         self.assertFalse(owner.quit_home_requested)
 
     def test_n_requests_cooperative_stage_skip_from_window_or_terminal(self):
-        for phase in ('WAIT_CALL','CALL','FLOOR','DISPLAY'):
+        for phase in ('WAIT_CALL','CALL','FLOOR','WAIT_DISPLAY','DISPLAY'):
             for source in ('window','terminal'):
                 with self.subTest(phase=phase,source=source):
                     owner=self.owner();owner.state.enter(phase,1.)
@@ -172,7 +172,7 @@ class QuitRunTests(unittest.TestCase):
                 result, events, owner = self.run_case(trigger)
                 self.assertEqual(result, 0)
                 self.assertTrue(owner.home)
-                self.assertIn(('robot_close', True), events)
+                self.assertIn(('robot_finish', True), events)
                 self.assertNotIn(('motion_begin',), events)
                 self.assertIn(('camera_close',), events)
                 self.assertIn(('worker_close',), events)
@@ -180,7 +180,7 @@ class QuitRunTests(unittest.TestCase):
     def test_q_from_startup_callback_homes_and_releases_resources(self):
         result, events, owner = self.run_case('startup_q')
         self.assertEqual(result, 0)
-        self.assertIn(('robot_close', True), events)
+        self.assertIn(('robot_finish', True), events)
         self.assertNotIn(('ready',), events)
         self.assertIn(('camera_close',), events)
         self.assertIn(('worker_close',), events)
@@ -189,7 +189,7 @@ class QuitRunTests(unittest.TestCase):
         result, events, owner = self.run_case('motion_q')
         self.assertEqual(result, 0)
         self.assertIn(('motion_begin',), events)
-        self.assertLess(events.index(('stop',)), events.index(('robot_close', True)))
+        self.assertLess(events.index(('stop',)), events.index(('robot_finish', True)))
         self.assertTrue(owner.quit_home_requested)
 
     def test_space_and_escape_never_home(self):
@@ -198,8 +198,8 @@ class QuitRunTests(unittest.TestCase):
                 result, events, owner = self.run_case(trigger)
                 self.assertEqual(result, 130)
                 self.assertFalse(owner.home)
-                self.assertIn(('robot_close', False), events)
-                self.assertNotIn(('robot_close', True), events)
+                self.assertIn(('robot_finish', False), events)
+                self.assertNotIn(('robot_finish', True), events)
 
     def test_failed_stop_after_q_never_requests_home(self):
         result, events, owner = self.run_case('motion_q', fail_stop=True)
@@ -207,8 +207,8 @@ class QuitRunTests(unittest.TestCase):
         self.assertIn('synthetic stop failure', str(result))
         self.assertTrue(owner.quit_home_requested)
         self.assertFalse(owner.home)
-        self.assertIn(('robot_close', False), events)
-        self.assertNotIn(('robot_close', True), events)
+        self.assertIn(('robot_finish', False), events)
+        self.assertNotIn(('robot_finish', True), events)
         self.assertIn(('camera_close',), events)
         self.assertIn(('worker_close',), events)
 
@@ -217,13 +217,13 @@ class QuitRunTests(unittest.TestCase):
         self.assertIsInstance(result, RuntimeError)
         self.assertIn('ordinary error after Q', str(result))
         self.assertFalse(owner.home)
-        self.assertIn(('robot_close', False), events)
+        self.assertIn(('robot_finish', False), events)
 
     def test_home_cleanup_failure_is_reported_and_other_resources_close(self):
         result, events, owner = self.run_case('motion_q', fail_cleanup=True)
         self.assertIsInstance(result, RuntimeError)
-        self.assertIn('synthetic disconnect failure', str(result))
-        self.assertIn(('robot_close', True), events)
+        self.assertIn('synthetic home/hold failure', str(result))
+        self.assertIn(('robot_finish', True), events)
         self.assertIn(('camera_close',), events)
         self.assertIn(('worker_close',), events)
 

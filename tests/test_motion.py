@@ -105,11 +105,86 @@ class PositionOnlyPlanningTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(pose[:3,3]-point),1.01e-4)
         arm.disconnect.assert_not_called()
 
+    def test_position_execution_uses_feedback_fk_and_waits_for_a_quiet_window(self):
+        robot,arm,c,d,thread=self.executing_robot()
+        arm.control_loop_active=True
+        c._arm_control_mode='posvel'
+        c._arm_group=NS(_pv_vlim=np.array([5.,5.,5.,3.,3.,3.]))
+        d._model,d._n=self.model,6
+        d._pad_q_for_model,d._compute_fk=self.pad,self.fk
+        point=np.array([.373,-.029,.734])
+        clock=[0.]
+        def sleep(seconds):clock[0]+=seconds
+        def read():
+            clock[0]+=.06
+            return c._q_target.copy(),np.zeros(6)
+        with patch.object(motion.threading,'Thread',side_effect=thread), \
+                patch.object(motion.time,'monotonic',side_effect=lambda:clock[0]), \
+                patch.object(motion.time,'sleep',side_effect=sleep), \
+                patch.object(robot,'_arm_feedback',side_effect=read) as feedback:
+            robot.move_position(point,3.,settle=motion.SettledArrival('approach',.15,
+                brake_tail_s=.7,stationary_vlim_rad_s=.05))
+        self.assertGreaterEqual(feedback.call_count,4)
+        np.testing.assert_allclose(robot._pose_from_joints(c._q_target)[:3,3],point,atol=.0001)
+        np.testing.assert_allclose(c._vlim_override,.05)
+
+    def test_ready_move_sends_j4_only_after_the_other_axes_settle(self):
+        target=pose6d_to_mat4(.30,0.,.30,0.,.7,0.)
+        for stalled in (False,True):
+            with self.subTest(stalled=stalled):
+                robot,arm,c,driver,thread=self.executing_robot()
+                c._q_target.fill(0.)
+                arm.control_loop_active=True
+                c._arm_control_mode='posvel'
+                c._arm_group=NS(_pv_vlim=np.array([5.,5.,5.,3.,3.,3.]))
+                driver._model,driver._n=self.model,6
+                driver._pad_q_for_model,driver._compute_fk=self.pad,self.fk
+                clock=[0.]
+                sent=[]
+                native=c._application_original_sender
+                def send(duration):
+                    sent.append((clock[0],duration,np.asarray(c._traj).copy()))
+                    native(duration)
+                c._application_original_sender=send
+                def sleep(seconds):clock[0]+=seconds
+                def feedback():
+                    clock[0]+=.06
+                    actual=c._q_target.copy()
+                    if stalled and sent:actual[2]+=.03
+                    return actual,np.zeros(6)
+                with patch.object(motion.threading,'Thread',side_effect=thread), \
+                        patch.object(motion.time,'monotonic',side_effect=lambda:clock[0]), \
+                        patch.object(motion.time,'sleep',side_effect=sleep), \
+                        patch.object(robot,'_arm_feedback',side_effect=feedback):
+                    if stalled:
+                        with self.assertRaisesRegex(TimeoutError,'grasp_ready_1'):
+                            robot.move_ready_in_stages(target,3.,1.5)
+                    else:
+                        robot.move_ready_in_stages(target,3.,1.5)
+                self.assertEqual(len(sent),1 if stalled else 2)
+                first=sent[0][2]
+                self.assertTrue(np.all(first[:,3]==0.))
+                self.assertGreater(abs(first[-1,2]),.5)
+                if not stalled:
+                    second=sent[1][2]
+                    others=[0,1,2,4,5]
+                    np.testing.assert_array_equal(second[0],first[-1])
+                    np.testing.assert_array_equal(second[:,others],np.broadcast_to(second[0,others],(len(second),5)))
+                    self.assertGreater(abs(second[-1,3]),.5)
+                    self.assertGreaterEqual(sent[1][0]-sent[0][0],.25)
+                    np.testing.assert_allclose(robot._pose_from_joints(second[-1]),target,atol=.0001)
+
     def test_failed_position_plan_never_starts_sender_and_leaves_recovery_to_journey(self):
         robot,arm,c,d,thread=self.executing_robot()
+        c._application_standoff_hold=True
+        c._vlim_override=np.full(6,.05)
+        held=c._q_target.copy()
         with patch.object(motion.threading,'Thread',side_effect=thread) as sender, \
                 self.assertRaises(motion.TrajectoryPlanningError):robot.move_position([2.,0.,2.],3.)
         sender.assert_not_called();self.assertTrue(robot.started)
+        self.assertTrue(c._application_standoff_hold)
+        np.testing.assert_array_equal(c._q_target,held)
+        np.testing.assert_allclose(c._vlim_override,.05)
         arm.disconnect.assert_not_called();c.safe_home.assert_not_called()
 
     def test_invalid_position_does_not_change_targets_or_call_planner(self):
@@ -238,7 +313,9 @@ class GripperZeroTests(unittest.TestCase):
 
 def stack():
     c=NS(_q_target=np.zeros(6),_qd_target=np.zeros(6),_vlim_override=None,_stop_send=threading.Event(),
-         _send_thread=None,_running=True,end=Mock(),safe_home=Mock())
+         _send_thread=None,_running=True,end=Mock(),safe_home=Mock(),
+         _model=NS(lowerPositionLimit=np.array([-2.8,-3.14,-3.14,-1.87,-1.57,-3.14]),
+                   upperPositionLimit=np.array([2.8,0.,0.,1.57,1.57,3.14])))
     arm=NS(get_state=lambda:(c._q_target.copy(),np.zeros(6),np.zeros(6)),disconnect=Mock())
     d=NS(start=Mock(),open_gripper=Mock(),_state_lock=threading.Lock(),_state="IDLE",_STATE_IDLE="IDLE",_gripper_motor=None,
          T=np.eye(4),_elevator_gripper_target=np.array([-.15]),_gripper_group=NS(send_pos_vel=Mock()))
@@ -292,6 +369,63 @@ class MotionTests(unittest.TestCase):
         np.testing.assert_array_equal(dense[[0,-1]],q[[0,-1]])
         self.assertTrue(np.all(dense>=q.min(axis=0)))
         self.assertTrue(np.all(dense<=q.max(axis=0)))
+
+    def test_approach_brakes_on_the_sdk_time_grid_and_resumes_normal_speed_for_next_move(self):
+        motion.sdk_types()
+        from reBotArm_control_py.controllers import RebotArmEndPose
+        native=np.array([.10,5.,5.,3.,3.,3.])
+        arm=NS(groups={'arm':NS(num_joints=6,_pv_vlim=native)},has_gripper=False,arm_control_mode='posvel')
+        controller=RebotArmEndPose(arm)
+        motion.configure_trajectory_sampling(controller,.1)
+        progress=np.linspace(0.,1.,31)
+        eased=10*progress**3-15*progress**4+6*progress**5
+        coarse=np.outer(eased,[.05,-.2,-.3,-.8,.2,.1])
+        controller._traj=list(coarse)
+        controller._application_standoff_brake=motion.SettledArrival('approach',.15,True,.7)
+        sent_positions,sent_caps,intervals=[],[],[]
+        def sample(interval):
+            sent_positions.append(controller._q_target.copy())
+            cap=controller._vlim_override
+            sent_caps.append(native.copy() if cap is None else cap.copy())
+            intervals.append(interval)
+        with patch.object(motion.time,'sleep',side_effect=sample):
+            controller._send_loop(3.)
+        dense=motion.densify_joint_samples(coarse,3.,.01)
+        np.testing.assert_array_equal(sent_positions,dense)
+        self.assertAlmostEqual(sum(intervals),3.)
+        caps=np.array(sent_caps)
+        np.testing.assert_array_equal(caps[0],native)
+        self.assertTrue(np.all(np.diff(caps,axis=0)<=1e-12))
+        required=np.abs(np.diff(dense,axis=0))/intervals[0]
+        self.assertTrue(np.all(caps[1:]>=np.minimum(required,native)-1e-12))
+        np.testing.assert_allclose(caps[-1],np.minimum(native,.15))
+        np.testing.assert_array_equal(controller._vlim_override,np.minimum(native,.15))
+        self.assertIsNone(controller._application_sender_error)
+        self.assertIsNone(controller._application_standoff_brake)
+        with patch.object(motion.time,'sleep'):
+            controller._traj=[dense[-1],dense[0]]
+            controller._send_loop(.3)
+        self.assertIsNone(controller._vlim_override)
+
+    def test_stop_during_approach_braking_does_not_send_the_remaining_targets(self):
+        native=np.full(6,3.)
+        controller=NS(_traj_params=NS(dt=.1),_dt=.01,_traj=[np.zeros(6),np.ones(6)*.06],
+            _send_loop=Mock(),_q_target=np.zeros(6),_stop_send=threading.Event(),_moving=True,
+            _vlim_override=None,_arm_group=NS(_pv_vlim=native))
+        motion.configure_trajectory_sampling(controller,.1)
+        controller._application_standoff_brake=motion.SettledArrival('approach',.15,True,.7)
+        stopped_at=[]
+        def stop_when_braking(_):
+            if controller._vlim_override is not None and np.max(controller._vlim_override)<3.:
+                stopped_at.append(controller._q_target.copy())
+                controller._stop_send.set()
+        with patch.object(motion.time,'sleep',side_effect=stop_when_braking):
+            controller._send_loop(1.)
+        self.assertEqual(len(stopped_at),1)
+        np.testing.assert_array_equal(controller._q_target,stopped_at[0])
+        self.assertLess(controller._q_target[0],.06)
+        self.assertFalse(controller._moving)
+        controller._application_original_sender.assert_not_called()
 
     def test_sampling_configuration_rejects_nonfinite_or_invalid_before_devices(self):
         from elevator import app
@@ -375,6 +509,18 @@ class MotionTests(unittest.TestCase):
         np.testing.assert_allclose(self.c._q_target,np.radians([0,0,-10,-20,0,0]))
         self.assertIsNone(self.c._vlim_override)
         self.c.move_to_traj.assert_not_called()
+
+    def test_head_rejects_every_out_of_limit_arm_axis_before_sending_a_target(self):
+        robot=self.robot()
+        getter=Mock(wraps=self.arm.get_state);self.arm.get_state=getter
+        for i,angle in enumerate([161.,.1,-180.,91.,90.,180.]):
+            angles=[0.]*7;angles[i]=angle
+            with self.subTest(axis=i+1),self.assertRaisesRegex(motion.HeadJointLimitError,f'J{i+1}'):
+                robot.head_up(angles)
+        getter.assert_not_called()
+        np.testing.assert_array_equal(self.c._q_target,np.zeros(6))
+        np.testing.assert_array_equal(self.d._elevator_gripper_target,[-.15])
+        self.assertIsNone(self.c._vlim_override)
 
     def test_nonfinite_user_targets_never_reach_sdk(self):
         r=self.robot()
@@ -471,6 +617,289 @@ class MotionTests(unittest.TestCase):
         r=self.robot();self.c.safe_home.side_effect=KeyboardInterrupt()
         with self.assertRaises(KeyboardInterrupt):r.close(home=True)
         self.arm.disconnect.assert_called()
+
+    def enabled_for_task_finish(self):
+        robot=self.robot()
+        self.c._n=6
+        self.c._arm_control_mode='posvel'
+        self.c._arm_group=NS(_pv_vlim=np.array([5.,5.,5.,3.,3.,3.]))
+        self.c._model=NS(lowerPositionLimit=np.full(6,-3.),upperPositionLimit=np.full(6,3.))
+        self.arm.control_loop_active=True
+        self.arm.close_control_session=Mock()
+        self.arm.joint_names=[f'joint{i}' for i in range(1,7)]+['gripper']
+        self.c._q_target[:]=-.2
+        def states(_, names=None, *, request_feedback=True):
+            return {name:NS(status_code=1,pos=q,vel=0.)
+                    for name,q in zip(self.arm.joint_names,self.c._q_target)}
+        return robot,states
+
+    @contextlib.contextmanager
+    def motion_clock(self):
+        now=[0.]
+        def sleep(seconds):now[0]+=seconds
+        with patch.object(motion.time,'monotonic',side_effect=lambda:now[0]), \
+                patch.object(motion.time,'sleep',side_effect=sleep):
+            yield now
+
+    def test_pose_and_hold_trace_share_one_valid_read_without_new_feedback_requests(self):
+        robot,_=self.enabled_for_task_finish()
+        q=np.arange(6)*.01
+        qd=q*.5
+        motors={name:Mock(get_state=Mock(return_value=NS(status_code=1,pos=position,vel=velocity)))
+                for name,position,velocity in zip(self.arm.joint_names,q,qd)}
+        motors['joint4'].get_state.return_value.torq=-1.4
+        bus=Mock()
+        self.arm._motor_map=motors
+        self.arm._ctrl_map={'arm':bus}
+        modeled_pose=np.eye(4)
+        with patch.object(robot,'_pose_from_joints',return_value=modeled_pose) as fk:
+            pose,feedback=robot.pose_with_feedback()
+            np.testing.assert_array_equal(fk.call_args.args[0],q)
+            self.assertIs(pose,modeled_pose)
+            np.testing.assert_array_equal(feedback.position_rad,q)
+            np.testing.assert_array_equal(feedback.velocity_rad_s,qd)
+            np.testing.assert_array_equal(feedback.target_rad,self.c._q_target)
+            self.assertEqual(feedback.joint4_torque_nm,-1.4)
+            bus.poll_feedback_once.assert_called_once()
+            for motor in motors.values():motor.request_feedback.assert_not_called()
+            motors['joint4'].get_state.return_value=None
+            with self.assertRaisesRegex(motion.ArmFeedbackError,'joint4'):
+                robot.pose_with_feedback()
+            fk.assert_called_once()
+
+    def test_finished_elevator_homes_and_automatically_closes_the_host_session(self):
+        robot,states=self.enabled_for_task_finish()
+        self.c._application_standoff_hold=True
+        events=[]
+        def safe_home():
+            self.assertFalse(self.c._application_standoff_hold)
+            events.append('home')
+            self.c._q_target.fill(0.)
+        self.c.safe_home.side_effect=safe_home
+        def record_close():
+            events.append('close')
+            self.assertGreaterEqual(now[0],.25)  # Zero crossing alone is insufficient.
+            self.assertLess(now[0],3.)
+        self.arm.close_control_session.side_effect=record_close
+        with patch.object(motion,'motor_feedback',side_effect=states), \
+                self.motion_clock() as now:
+            robot.finish_task(home=True)
+        self.assertEqual(events,['home','close'])
+        np.testing.assert_array_equal(self.c._q_target,np.zeros(6))
+        self.assertFalse(self.c._running or robot.started)
+        self.arm.disconnect.assert_not_called()
+        self.c.end.assert_not_called()
+
+    def test_unconfirmed_home_stops_and_cleans_up_without_disabling(self):
+        robot,states=self.enabled_for_task_finish()
+        with patch.object(motion,'motor_feedback',side_effect=states), \
+                self.motion_clock(), \
+                self.assertRaisesRegex(RuntimeError,'未确认回零'):
+            robot.finish_task(home=True)
+        self.c.safe_home.assert_called_once()
+        np.testing.assert_allclose(self.c._q_target,np.full(6,-.2))
+        self.assertFalse(robot.started)
+        self.arm.close_control_session.assert_called_once()
+        self.arm.disconnect.assert_not_called()
+
+    def test_elevator_soft_stop_does_not_home_or_disable(self):
+        robot,states=self.enabled_for_task_finish()
+        with patch.object(motion,'motor_feedback',side_effect=states):
+            robot.finish_task(home=False)
+        self.c.safe_home.assert_not_called()
+        self.arm.disconnect.assert_not_called()
+        self.arm.close_control_session.assert_called_once()
+        np.testing.assert_allclose(self.c._q_target,np.full(6,-.2))
+
+    def test_disabled_or_missing_joint_feedback_cannot_authorize_homing(self):
+        robot,states=self.enabled_for_task_finish()
+        current=states(self.arm)
+        current['joint3'].status_code=0
+        del current['joint5']
+        with patch.object(motion,'motor_feedback',return_value=current), \
+                self.assertRaisesRegex(RuntimeError,'joint3.*joint5'):
+            robot.finish_task(home=True)
+        self.c.safe_home.assert_not_called()
+        self.arm.close_control_session.assert_called_once()
+        self.arm.disconnect.assert_not_called()
+
+    def test_standoff_hold_caps_correction_without_changing_final_joint_target(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c._arm_control_mode='posvel'
+        self.c._arm_group=NS(_pv_vlim=np.array([.1,5.,5.,3.,3.,3.]))
+        self.c._vlim_override=np.array([.2,.08,.2,.4,.3,.4])
+        target=self.c._q_target.copy()
+        robot.limit_hold_correction(.15)
+        np.testing.assert_array_equal(self.c._q_target,target)
+        np.testing.assert_allclose(self.c._vlim_override,[.10,.08,.15,.15,.15,.15])
+        robot.move(np.eye(4))
+        self.assertIsNone(self.c._vlim_override)  # No cap inherited by contact/grasp.
+
+    def test_previous_hold_cap_is_retained_during_ik_then_released_by_sender(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c._traj_params=NS(dt=.1);self.c._dt=.01
+        self.c._traj=[np.zeros(6),np.ones(6)*.002]
+        def send(duration):
+            self.assertFalse(self.c._application_standoff_hold)
+            self.assertIsNone(self.c._vlim_override)
+        self.c._send_loop=Mock(side_effect=send)
+        motion.configure_trajectory_sampling(self.c,.1)
+        self.c._application_standoff_hold=True
+        robot.limit_hold_correction(.05)
+        def plan(*args,duration):
+            self.assertTrue(self.c._application_standoff_hold)
+            np.testing.assert_allclose(self.c._vlim_override,.05)
+            self.c._send_loop(duration)
+            return True
+        self.c.move_to_traj.side_effect=plan
+        robot.move(np.eye(4))
+        self.c._application_original_sender.assert_called_once()
+
+    def test_cancelled_or_empty_following_sender_keeps_the_standoff_hold(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c._traj_params=NS(dt=.1);self.c._dt=.01
+        self.c._send_loop=Mock()
+        motion.configure_trajectory_sampling(self.c,.1)
+        self.c._application_standoff_hold=True
+        robot.limit_hold_correction(.05)
+        held=self.c._q_target.copy()
+        self.c._traj=[held,np.zeros(6)]
+        self.c._stop_send.set()
+        self.c._send_loop(1.)
+        self.assertIsNone(self.c._application_sender_error)
+        self.c._stop_send.clear()
+        self.c._traj=[]
+        self.c._send_loop(1.)
+        self.assertIn('后续轨迹点不足',str(self.c._application_sender_error))
+        self.c._application_original_sender.assert_not_called()
+        self.assertTrue(self.c._application_standoff_hold)
+        np.testing.assert_array_equal(self.c._q_target,held)
+        np.testing.assert_allclose(self.c._vlim_override,.05)
+
+    def test_approach_sender_parameter_error_does_not_count_as_arrival(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c._arm_control_mode='posvel'
+        self.c._arm_group=NS()
+        self.c._traj_params=NS(dt=.1);self.c._dt=.01
+        self.c._send_loop=Mock()
+        motion.configure_trajectory_sampling(self.c,.1)
+        def plan(*args,duration):
+            self.c._stop_send.clear()
+            self.c._traj=[np.zeros(6),np.ones(6)*.002]
+            self.c._send_loop(duration)
+            return True
+        self.c.move_to_traj.side_effect=plan
+        for native,hold in ((np.ones(5),.15),(np.ones(6),float('nan'))):
+            self.c._arm_group._pv_vlim=native
+            with self.subTest(native=native,hold=hold),patch.object(robot,'_wait_feedback_settle') as wait, \
+                    self.assertRaisesRegex(motion.TrajectorySendError,'SDK轨迹发送失败.*速度参数无效'):
+                robot.move(np.eye(4),settle=motion.SettledArrival('approach',hold,True,.7))
+            wait.assert_not_called()
+            self.assertTrue(self.c._stop_send.is_set())
+        self.arm.disconnect.assert_not_called()
+
+    def test_single_in_position_sample_with_joint_velocity_does_not_latch_or_finish(self):
+        robot,_=self.enabled_for_task_finish()
+        nominal=self.c._q_target.copy()
+        quiet=nominal.copy();quiet[3]+=.004
+        later=quiet.copy();later[3]+=.0004
+        counts=[0]
+        aim_during_read=[]
+        def measure():
+            aim_during_read.append(self.c._q_target.copy())
+            counts[0]+=1
+            now[0]+=.06
+            if counts[0]==1:return nominal,np.array([0.,0.,0.,.22,0.,0.])
+            return (quiet if counts[0]==2 else later),np.zeros(6)
+        with self.motion_clock() as now,patch.object(robot,'_arm_feedback',side_effect=measure):
+            actual=robot._wait_feedback_settle(motion.SettledArrival('retreat',.15,True),lambda:False,
+                                               lambda q:(True,q[:3],True))
+        self.assertGreaterEqual(counts[0],5)
+        np.testing.assert_array_equal(aim_during_read[1],nominal)
+        np.testing.assert_array_equal(self.c._q_target,quiet)
+        np.testing.assert_array_equal(actual,later)
+
+    def test_standoff_latches_measured_angles_only_after_a_quiet_window(self):
+        robot,_=self.enabled_for_task_finish()
+        nominal=self.c._q_target.copy()
+        observed=nominal.copy();observed[1]+=.004
+        self.c._qd_target[:]=.01
+        caps=[]
+        def measure():
+            caps.append(self.c._vlim_override.copy())
+            np.testing.assert_array_equal(self.c._q_target,nominal)
+            self.assertFalse(getattr(self.c,'_application_standoff_hold',False))
+            now[0]+=.06
+            return observed,np.zeros(6)
+        with self.motion_clock() as now,patch.object(robot,'_arm_feedback',side_effect=measure):
+            actual=robot._wait_feedback_settle(
+                motion.SettledArrival('approach',.15,stationary_vlim_rad_s=.05,lock_after_settle=True),
+                lambda:False,lambda q:(True,q[:3],True))
+        self.assertGreaterEqual(len(caps),4)
+        np.testing.assert_allclose(caps[0],.15)
+        np.testing.assert_allclose(caps[1:],.05)
+        self.assertTrue(self.c._application_standoff_hold)
+        np.testing.assert_array_equal(self.c._q_target,observed)
+        np.testing.assert_array_equal(self.c._qd_target,np.zeros(6))
+        np.testing.assert_array_equal(actual,observed)
+
+    def test_three_mm_reversal_around_the_first_sample_does_not_count_as_settled(self):
+        robot,_=self.enabled_for_task_finish()
+        nominal=self.c._q_target.copy()
+        count=[0]
+        def measure():
+            q=nominal.copy()
+            if count[0]:q[0]+=.0015*(-1)**count[0]
+            count[0]+=1
+            now[0]+=.06
+            return q,np.zeros(6)
+        report=io.StringIO()
+        with self.motion_clock() as now,patch.object(robot,'_arm_feedback',side_effect=measure), \
+                contextlib.redirect_stdout(report),self.assertRaisesRegex(TimeoutError,'末端未停稳.*approach'):
+            robot._wait_feedback_settle(
+                motion.SettledArrival('approach',.15,stationary_vlim_rad_s=.05,lock_after_settle=True),
+                lambda:False,lambda q:(True,q[:3],True))
+        self.assertFalse(getattr(self.c,'_application_standoff_hold',False))
+        self.assertIn('fk_axis_range_mm=[3.0, 0.0, 0.0]',report.getvalue())
+        self.assertIn('hold_target_range_deg=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]',report.getvalue())
+
+    def test_position_oscillation_times_out_even_with_low_instantaneous_velocity(self):
+        robot,_=self.enabled_for_task_finish()
+        nominal=self.c._q_target.copy()
+        row=[0]
+        def measure():
+            row[0]+=1;now[0]+=.06
+            q=nominal.copy();q[4]+=.006*(-1)**row[0]
+            return q,np.zeros(6)
+        with self.motion_clock() as now,patch.object(robot,'_arm_feedback',side_effect=measure), \
+                self.assertRaisesRegex(TimeoutError,'末端未停稳.*retreat'):
+            robot._wait_feedback_settle(motion.SettledArrival('retreat',.15,True),lambda:False,
+                                        lambda q:(True,q[:3],True))
+        self.assertGreaterEqual(now[0],3.)
+        self.assertLess(now[0],3.1)
+
+    def test_non_contact_hold_does_not_recommand_an_angle_outside_sdk_joint_limits(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c._q_target[1]=0.
+        self.c._model.upperPositionLimit[1]=0.
+        q=self.c._q_target.copy()
+        q[1]=.005  # Feedback extends a little past the limit, e.g. zero calibration.
+        with self.motion_clock(),patch.object(robot,'_arm_feedback',return_value=(q,np.zeros(6))):
+            robot._wait_feedback_settle(
+                motion.SettledArrival('approach',.15,stationary_vlim_rad_s=.05,lock_after_settle=True),
+                lambda:False,lambda sample:(True,sample[:3],True))
+        self.assertTrue(self.c._application_standoff_hold)
+        self.assertEqual(self.c._q_target[1],0.)
+
+    def test_home_with_zero_position_but_moving_feedback_is_reported_as_failure(self):
+        robot,_=self.enabled_for_task_finish()
+        self.c.safe_home.side_effect=lambda:self.c._q_target.fill(0)
+        with self.motion_clock(),patch.object(robot,'_arm_feedback',side_effect=lambda:(
+                self.c._q_target.copy(),np.full(6,.1))), \
+                self.assertRaisesRegex(RuntimeError,'未确认回零.*关节速度'):
+            robot.finish_task(home=True)
+        self.arm.close_control_session.assert_called_once()
+        self.arm.disconnect.assert_not_called()
 
     def test_measured_ten_degree_close_reference_is_separate_from_six_axis_zero(self):
         r=self.robot()
@@ -628,6 +1057,54 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(events[-1],"start_loop")
         arm._motor_map["gripper"].ensure_mode.assert_called_once_with(1,1000)
 
+    def test_joint4_integral_adjustment_and_rollback_preserve_kp_and_other_joints(self):
+        for ki_scale in (.5,1.):
+            with self.subTest(ki_scale=ki_scale):
+                arm,_,driver,events=self.hardware()
+                arm._all_joints[3].pos_kp=70.
+                arm._all_joints[3].pos_ki=1.
+                joint4=arm._motor_map['joint4']
+                def readback(rid,timeout):
+                    events.append(f'read_j4_{rid}')
+                    return {27:56.,28:ki_scale}[rid]
+                joint4.get_register_f32=Mock(side_effect=readback)
+                driver.start=lambda:motion.start_driver(driver)
+                robot=motion.Robot({'robot_control':{'joint4_pos_kp_scale':.8,'joint4_pos_ki_scale':ki_scale}},
+                                   factory=lambda cfg:(arm,driver._controller,driver))
+                with patch.object(motion.time,'sleep'):
+                    robot.start()
+                self.assertEqual([call.args for call in joint4.get_register_f32.call_args_list],[(27,1000),(28,1000)])
+                self.assertLess(events.index('read_j4_28'),events.index('enable:joint1'))
+                self.assertEqual(arm._all_joints[3].pos_kp,70.)
+                self.assertEqual(arm._all_joints[3].pos_ki,1.)
+                for joint in arm._all_joints:
+                    kp,ki=(56.,ki_scale) if joint.name=='joint4' else (joint.pos_kp,joint.pos_ki)
+                    values=[call.args for call in arm._motor_map[joint.name].write_register_f32.call_args_list]
+                    self.assertEqual(values,[(25,joint.vel_kp),(26,joint.vel_ki),(27,kp),(28,ki)])
+
+    def test_joint4_gain_readback_mismatch_prevents_any_enable(self):
+        for readback,failed_gain in (({27:70.,28:.5},'pos_kp'),({27:56.,28:1.},'pos_ki')):
+            with self.subTest(gain=failed_gain):
+                arm,_,driver,events=self.hardware()
+                driver._joint4_pos_kp_scale=.8
+                driver._joint4_pos_ki_scale=.5
+                arm._all_joints[3].pos_kp=70.
+                arm._all_joints[3].pos_ki=1.
+                arm._motor_map['joint4'].get_register_f32=Mock(side_effect=lambda rid,timeout:readback[rid])
+                with patch.object(motion.time,'sleep'),self.assertRaisesRegex(RuntimeError,f'joint4.*{failed_gain}.*读回='):
+                    motion.start_driver(driver)
+                self.assertFalse(any(event.startswith('enable:') for event in events))
+                arm.start_control_loop.assert_not_called()
+
+    def test_invalid_integral_scale_is_rejected_before_constructing_devices(self):
+        for value in (-.1,float('nan'),True,1.1):
+            with self.subTest(scale=value):
+                factory=Mock(side_effect=AssertionError('device'))
+                robot=motion.Robot({'robot_control':{'joint4_pos_ki_scale':value}},factory=factory)
+                with self.assertRaisesRegex(ValueError,'joint4_pos_ki_scale'):
+                    robot.start()
+                factory.assert_not_called()
+
     def test_elevator_initializes_seventh_pos_vel_before_enable_and_holds_measured_angle(self):
         arm,bus,d,events=self.hardware();d._elevator_gripper_posvel=True
         arm._motor_map["gripper"].state.pos=-.15
@@ -695,6 +1172,28 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(arm._connected)
         arm.disconnect()  # Idempotent even after an unsuccessful native shutdown.
         bus.close.assert_called_once()
+
+    def test_local_exit_stops_loop_and_frees_handles_without_disable_or_native_shutdown(self):
+        arm,bus,d,events=self.hardware()
+        motors=list(arm._motor_map.values())
+        arm.close_control_session()
+        arm.close_control_session()
+        self.assertEqual(events[:2],['stop_loop','close_bus'])
+        bus.shutdown.assert_not_called()
+        bus.close.assert_called_once()
+        self.assertFalse(arm._ctrl_map or arm._motor_map)
+        for motor in motors:
+            motor.disable.assert_not_called()
+            motor.close.assert_called_once()
+
+    def test_local_exit_never_frees_handles_beneath_a_running_control_thread(self):
+        arm,bus,d,_=self.hardware()
+        arm.control_loop_active=True
+        with self.assertRaisesRegex(RuntimeError,'控制循环线程未退出'):
+            arm.close_control_session()
+        bus.close.assert_not_called()
+        bus.close_bus.assert_not_called()
+        bus.shutdown.assert_not_called()
 
     def test_connect_exception_cleans_partial_bus_without_enabling(self):
         arm,bus,d,events=self.hardware()

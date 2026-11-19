@@ -58,7 +58,7 @@ class SequenceTests(unittest.TestCase):
 
     def test_invalid_targets_or_times_fail_before_devices(self):
         for argv in (["--place-xyz-m","nan","0","0"],["--place-duration-s","0"],["--auto-floor-timeout-s","nan"],
-                     ["--place-rpy-deg","0","inf","0"],["--standoff-m",".2"]):
+                     ["--place-rpy-deg","0","inf","0"],["--standoff-m",".3"]):
             with self.subTest(argv=argv),patch.object(app,"run_elevator",side_effect=AssertionError("hardware")),contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(entry().main(["--floor","3",*argv]),2)
 
@@ -88,7 +88,9 @@ class SequenceTests(unittest.TestCase):
         clock=[100.];events=[];moving=[False];g_sent=[False];g_at=[None];picked_snapshot=[]
         cfg={"camera":{"type":"realsense_d405"},"robot":{"ready_pose":dict(x=.3,y=0.,z=.3,roll=0.,pitch=.7,yaw=0.,duration=3.)}}
         options=app.load_workflow(ROOT/"config/261105_my_elevator.yaml")
-        options["elevator"].update(dwell_s=0.,standoff_m=.05,target_offset_base_m=[.05,.0235,.0139])
+        options["elevator"].update(dwell_s=0.,standoff_m=.05,target_offset_base_m=[.05,.0235,.0139],
+                                   button_orientation='free')
+        options['elevator']['refinement']['enabled']=False
         args=NS(execute=execute,stage="contact",device="cpu",floor=floor,sequence_mode=True,auto_floor_timeout_s=3.,
                 place_xyz_m=[.25,-.38,.35],place_rpy_deg=None,place_duration_s=3.,release_wait_s=0.)
         class Camera:
@@ -126,7 +128,7 @@ class SequenceTests(unittest.TestCase):
             def _position_done(self):return not (fail_release and self.opens==2)
             def grasp(self):events.append("grasp");return not empty
         class Robot:
-            def __init__(self):self.T=pose6d_to_mat4(.26,0,.192,0,0,0);self.driver=Driver();self.moves=[];self.closed=False;self.head=False
+            def __init__(self):self.T=pose6d_to_mat4(.26,0,.192,0,0,0);self.driver=Driver();self.moves=[];self.finished=False;self.head=False
             def start(self,**kw):events.append("start:"+str(kw.get("gripper_posvel")))
             def pose(self):return self.T.copy()
             def move(self,T,duration,cancelled):
@@ -136,6 +138,10 @@ class SequenceTests(unittest.TestCase):
                     if fail_place and np.allclose(T[:3,3],args.place_xyz_m):raise RuntimeError("place IK failed")
                     self.T=T.copy();self.moves.append(T.copy());events.append("move:"+("panel" if self.head else "grasp/place"))
                 finally:moving[0]=False
+            def move_position(self,tip,duration,cancelled,*,tip_offset):
+                target=geometry.pose_for_tip(self.T,tip,tip_offset)
+                self.move(target,duration,cancelled)
+                return target
             def switch_gripper_to_posvel(self,cancelled):
                 events.append("switch")
                 if fail_switch:raise RuntimeError("mode ack failed")
@@ -144,7 +150,7 @@ class SequenceTests(unittest.TestCase):
                 self.head_target=list(a[0])
                 self.T=pose6d_to_mat4(.26,0,.35,0,-.5,0)
             def stop(self):events.append("stop")
-            def close(self,home=False):self.closed=True;events.append("close:"+str(home))
+            def finish_task(self,*,home):self.finished=True;events.append("finish:"+str(home))
         camera=Camera();worker=Worker();robot=Robot()
         def key(*_):
             if abort_grasp and worker.kind=="grasp":return ord("q")
@@ -188,7 +194,7 @@ class SequenceTests(unittest.TestCase):
         self.assertTrue(camera.closed and worker.closed)
         self.assertEqual(camera.opens,1)
         if execute:
-            factory.assert_called_once();self.assertTrue(robot.closed)
+            factory.assert_called_once();self.assertTrue(robot.finished)
             self.assertEqual(factory.call_args.args[0]['trajectory'],options['trajectory'])
         else:factory.assert_not_called()
         return events,robot,worker,g_at[0],picked_snapshot
@@ -206,15 +212,16 @@ class SequenceTests(unittest.TestCase):
         np.testing.assert_allclose(r.moves[4][:3,3],[.25,-.38,.35])
         self.assertEqual(len(r.moves),8) # ready, pre, grasp, ready, place, approach, surface, retreat
         self.assertGreaterEqual(w.panel_count,3)
+        np.testing.assert_allclose(r.moves[-3][:3,:3],pose6d_to_mat4(0,0,0,0,-.5,0)[:3,:3])
         np.testing.assert_allclose(r.moves[-1],r.moves[-3])
-        self.assertEqual(events[-1],"close:True")
+        self.assertEqual(events[-1],"finish:True")
 
     def test_empty_grasp_or_user_abort_never_switches_to_elevator(self):
         for kwargs in (dict(empty=True),dict(abort_grasp=True)):
             with self.subTest(kwargs=kwargs):
                 events,r,*_=self.flow(**kwargs)
                 self.assertNotIn("switch",events);self.assertNotIn("head",events)
-                self.assertEqual(events[-1],"close:False")
+                self.assertEqual(events[-1],"finish:False")
 
     def test_nondefault_floor_runs_same_sequence_after_that_floor_becomes_stable(self):
         for floor in ('4','-1','12'):
@@ -224,26 +231,28 @@ class SequenceTests(unittest.TestCase):
             self.assertIn(f'自动等待稳定{floor}楼',output.getvalue())
             self.assertIn(f'{floor}楼纸面接触及撤回完成',output.getvalue())
             self.assertGreaterEqual(w.panel_count,3)
-            self.assertEqual(len(r.moves),8);self.assertEqual(events[-1],'close:True')
+            self.assertEqual(len(r.moves),8);self.assertEqual(events[-1],'finish:True')
 
     def test_stable_three_never_substitutes_for_missing_requested_floor(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             events,r,*_=self.flow(floor='4',missing_floor=True)
         self.assertEqual(events.count('move:panel'),0)
-        self.assertEqual(events[-1],'close:False')
+        self.assertEqual(events[-1],'finish:True')
 
     def test_place_release_and_mode_failures_stop_before_head_and_contact(self):
         for kwargs in (dict(fail_place=True),dict(fail_release=True),dict(fail_switch=True)):
             with self.subTest(kwargs=kwargs):
                 events,r,*_=self.flow(**kwargs)
-                self.assertNotIn("head",events);self.assertEqual(events[-1],"close:False")
+                self.assertNotIn("head",events)
+                self.assertEqual(events[-1],"finish:"+str(bool(kwargs.get("fail_release"))))
                 if kwargs.get("fail_place"):self.assertEqual(events.count("open"),1)
 
     def test_missing_three_invalid_depth_and_contact_cancel_never_touch_surface(self):
         for kwargs in (dict(missing_floor=True),dict(invalid_depth=True),dict(cancel_contact=True)):
             with self.subTest(kwargs=kwargs):
                 events,r,*_=self.flow(**kwargs)
-                self.assertIn("head",events);self.assertEqual(events[-1],"close:False")
+                self.assertIn("head",events)
+                self.assertEqual(events[-1],"finish:"+str(not kwargs.get("cancel_contact",False)))
                 self.assertEqual(events.count("move:panel"),0)
 
     def test_dry_run_only_uses_camera_and_model(self):

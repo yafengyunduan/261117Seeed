@@ -600,6 +600,7 @@ class RegionOCR:
     def clear(self):
         self.memories=[];self.last_doors={};self.last_glyphs={};self.evidence={}
         self.origin=(0,0);self.now=0.;self.offline=False;self.ready=False
+        self.focus_px=None
         self.last_inference_stats={};self.last_patch_candidates=0
         self.retry_audit={};self.retry_stats={}
 
@@ -693,7 +694,17 @@ class RegionOCR:
             memory['ocr_current']=False
             entries.append(memory)
         self.memories=entries
+        # A current pixel match on most rims can verify the second frame
+        # before the outer geometry tracker publishes its count for this frame.
+        matched_panel=len(entries)>=4 and sum(m['same_pixels'] for m in entries)>=.7*len(entries)
+        priority=None
+        if self.focus_px is not None:
+            u,v=self.focus_px
+            distance,index=min(((math.hypot(m['ring'].x-u,m['ring'].y-v)/m['ring'].radius,i)
+                                for i,m in enumerate(entries)),default=(math.inf,None))
+            if distance<=1.5:priority=index
         eligible=[]
+        first=priority
         for i,memory in enumerate(entries):
             if memory['door']['label']!='UNKNOWN':continue
             age=self.now-memory['last_attempt']
@@ -702,9 +713,11 @@ class RegionOCR:
             # Unchanged unread glyphs do not improve by repeatedly submitting
             # identical crops. Changed pixels always create a fresh memory.
             if memory['best'] is None and memory['attempts']>=2:
-                due=age>=min(8.,max(1.,2*self.refresh_s))
-            if self.offline or (self.ready and due):eligible.append(i)
-        eligible.sort(key=lambda i:(entries[i]['last_attempt'],entries[i]['id']))
+                due=age>=(.4 if i==priority else min(8.,max(1.,2*self.refresh_s)))
+                if i==priority:first=None  # Leave room for other numeric anchors after repeated misses.
+            ready=self.ready or (matched_panel and memory['same_pixels'])
+            if self.offline or (ready and due):eligible.append(i)
+        eligible.sort(key=lambda i:(i!=first,entries[i]['last_attempt'],entries[i]['id']))
         selected=eligible if self.offline else eligible[:self.budget]
         if selected:
             samples=[replace(rings[i],radius=entries[i]['sample_radius']) for i in selected]
@@ -760,7 +773,7 @@ class RegionOCR:
                      glyph_retry_patches=self.retry_stats.get('glyph_retry_patches',0))
         stats.update(ocr_buttons=len(selected),cached_buttons=sum(e['source']=='PIXEL_MATCHED_CACHE' for e in self.evidence.values()),
                      skipped_symbol_buttons=sum(m['door']['label']!='UNKNOWN' for m in entries),
-                     geometry_settled=self.ready)
+                     geometry_settled=self.ready or matched_panel)
         self.last_inference_stats=stats;self.last_patch_candidates=len(selected)
         return observations
 
@@ -870,21 +883,21 @@ class FastPanelPerception(vision.PanelPerception):
 
     def request_refresh(self):self.reset_requested=True
 
-    def process(self,image,captured_at=None,offline=False):
+    def process(self,image,captured_at=None,offline=False,*,focus_px=None):
         if self.reset_requested or offline:
             self.roi_bounds=None;self.settled=0;self.last_rings=[];self.layout.reset();self.ocr.clear();self.reset_requested=False
-            self.search_tick=0
+            self.search_tick=0;self.calls=0
             self.position_support.reset()
         at=time.perf_counter() if captured_at is None else float(captured_at)
         box=None if offline else self.roi_bounds
         ox,oy=(0,0) if box is None else box[:2]
         work=image if box is None else image[box[1]:box[3],box[0]:box[2]]
         self.ocr.origin=(ox,oy);self.ocr.now=at;self.ocr.offline=offline;self.ocr.ready=offline or self.settled>=2
+        self.ocr.focus_px=None if offline else focus_px
         model=self.model
         # Whole-frame YOLO is only an acquisition aid; current ROI rim evidence
-        # is checked every update. A failed track triggers reacquisition.
+        # is checked every update. On a miss, keep the normal YOLO interval.
         if box is not None:self.model=None
-        elif not offline:self.calls=0
         try:result=super().process(work,captured_at=at,offline=offline)
         finally:self.model=model
         result.buttons=[replace(b,ring=replace(b.ring,x=b.ring.x+ox,y=b.ring.y+oy),
@@ -929,7 +942,9 @@ class FastPanelPerception(vision.PanelPerception):
                     self.layout.seed(image[y0:y1,x0:x1],local)
             else:
                 self.settled=0;self.lost+=1;self.ocr.clear()
-                if self.lost>=2:self.roi_bounds=None;self.layout.reset()
+                if self.lost>=2:
+                    if self.roi_bounds is not None:self.calls=0
+                    self.roi_bounds=None;self.layout.reset()
             self.last_rings=current
         result.tracking['geometry_settled_frames']=self.settled
         started=time.perf_counter()

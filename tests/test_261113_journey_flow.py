@@ -21,6 +21,7 @@ class JourneyMethodTests(unittest.TestCase):
     def setUp(self):
         self.cfg = {'camera': {'type': 'realsense_d405'}, 'robot': {}}
         self.options = app.load_workflow(ROOT/'config/261105_my_elevator.yaml')
+        self.options['elevator']['refinement']['enabled'] = False
         self.settings = journey.load_settings(ROOT/'config/261113_my_journey.yaml',self.options)
         self.args = NS(place_xyz_m=[.25, -.38, .35], place_rpy_deg=None,
                        place_duration_s=3., release_wait_s=.5, press_stage='contact')
@@ -110,7 +111,7 @@ class JourneyMethodTests(unittest.TestCase):
         with patch.object(journey.time, 'perf_counter', return_value=1001.):
             self.flow.key('c', 1000.)
         self.assertEqual(self.flow.state.phase, 'CALL')
-        self.assertEqual(self.flow.state.deadline, 1001.+self.settings['search_timeout_s'])
+        self.assertEqual(self.flow.state.deadline, 1001.+self.settings['search_timeout_s']['call'])
         self.assertEqual(self.flow.generation, generation+1)
         self.flow.robot.head_up.assert_called_once()  # C does not repeat the move.
 
@@ -409,7 +410,7 @@ class JourneyMethodTests(unittest.TestCase):
         expected=np.array([.22,0.,.6])+self.options['elevator']['target_offset_base_m']
         np.testing.assert_allclose(execute.call_args.args[1],expected)
         self.assertEqual(self.flow.floor,'3')
-        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
         self.assertEqual(self.flow.floor_cache,{})
 
     def test_floor_cache_can_bridge_entire_panel_detector_dropout(self):
@@ -574,12 +575,17 @@ class JourneyMethodTests(unittest.TestCase):
         expected = np.array([.22, 0., .6])+self.options['elevator']['target_offset_base_m']
         np.testing.assert_allclose(target, expected, atol=1e-10)
         self.assertEqual(self.flow.floor, '3')
-        self.assertEqual(self.flow.state.phase, 'DISPLAY')
+        self.assertEqual(self.flow.state.phase, 'WAIT_DISPLAY')
         np.testing.assert_allclose(self.flow.robot.head_up.call_args.args[0][:6], self.settings['display_view_deg'])
-        self.assertEqual(self.flow.arrival_deadline, 101.+self.settings['arrival_timeout_s'])
+        self.assertIsNone(self.flow.arrival_deadline)
         self.assertIsNone(self.flow.last); self.assertIsNone(self.flow.last_snapshot)
         self.assertIsNone(self.flow.request)
         self.assertEqual(self.flow.generation, 1)
+        with patch.object(journey.time, 'perf_counter', return_value=102.):
+            self.flow.key('c',102.)
+        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.arrival_deadline,102.+self.settings['arrival_timeout_s'])
+        self.flow.robot.head_up.assert_called_once()
 
     def test_n_skips_call_and_pre_call_wait_without_visual_evidence(self):
         for phase in ('WAIT_CALL','CALL'):
@@ -610,17 +616,18 @@ class JourneyMethodTests(unittest.TestCase):
                 with patch.object(journey.app,'execute_button') as execute:
                     self.flow.key('N',100.1)
                 execute.assert_not_called()
-                self.assertEqual(self.flow.state.phase,'DISPLAY')
+                self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
                 self.assertEqual(self.flow.floor,selected or typed)
-                self.assertIsNotNone(self.flow.arrival_deadline)
+                self.assertIsNone(self.flow.arrival_deadline)
                 self.assertIsNone(self.flow.request);self.assertIsNone(self.flow.floor_input_due)
                 np.testing.assert_allclose(self.flow.robot.head_up.call_args.args[0][:6],self.settings['display_view_deg'])
 
     def test_skip_floor_without_target_allows_arrival_only_input_and_never_presses(self):
         self.flow.state.enter('FLOOR',100.)
         self.flow.key('N',100.1)
-        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
         self.assertIsNone(self.flow.floor);self.assertIsNone(self.flow.arrival_deadline)
+        self.flow.key('C',100.15)
         # No button panel or OCR is required to set the LCD comparison target.
         self.assertIsNone(self.flow.last)
         self.flow.key('-',100.2);self.flow.key('1',100.3)
@@ -696,7 +703,7 @@ class JourneyMethodTests(unittest.TestCase):
         self.assertEqual(events,['stop','retreat','head'])
         np.testing.assert_allclose(self.flow.robot.move.call_args.args[0],retreat)
         self.assertIsNone(self.flow.skip_retreat)
-        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
 
     def test_failed_skip_retreat_does_not_change_posture_or_request_home(self):
         self.flow.state.enter('FLOOR',100.)
@@ -716,7 +723,7 @@ class JourneyMethodTests(unittest.TestCase):
         with patch.object(journey.app,'execute_button',side_effect=cancelled_before_move):
             self.flow.stage_action(self.flow.press,self.snapshot(100.15))
         self.flow.robot.move.assert_not_called()
-        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
         self.assertEqual(self.flow.floor,'3')
 
     def test_free_position_press_skips_level_pose_and_n_uses_position_retreat(self):
@@ -735,7 +742,7 @@ class JourneyMethodTests(unittest.TestCase):
                 patch.object(journey.geometry,'level_pose',side_effect=AssertionError('must not level')):
             self.flow.stage_action(self.flow.press,self.snapshot(100.15))
         self.flow.robot.move.assert_not_called();self.flow.robot.move_position.assert_called_once()
-        self.assertEqual(self.flow.state.phase,'DISPLAY')
+        self.assertEqual(self.flow.state.phase,'WAIT_DISPLAY')
 
     def test_display_historical_or_unstable_value_cannot_be_ready(self):
         for state, current in (('NO_TEXT', None), ('UNSTABLE', '3'), ('STABLE', None)):

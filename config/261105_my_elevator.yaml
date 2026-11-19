@@ -10,14 +10,29 @@ initial_poses:
     roll: 0.0
     pitch: 0.7
     yaw: 0.0
-    duration: 3.0
+    duration: 2.5
+    # 启动时其他五轴先到位停稳，J4 保持起始角。第二段仅转 J4，参考秒数如下。
+    # 设为 0 恢复原来的单段启动预备轨迹。
+    joint4_stage_duration_s: 1.5
   # 2. 外呼上下键初始视角：六轴绝对角度，单位度。
-  call_view_deg: [0, -25, -30, -10, 0, 0]
+  call_view_deg: [0, -25, -50, -10, 0, 0]
   # 3. 轿内楼层按键初始视角：外呼结束后恢复此姿态，按C开始识别。
   floor_view_deg: [0, -25, -50, -10, 0, 0]
   # 4. LCD当前楼层识别初始视角：楼层按键结束后恢复此姿态。
-  display_view_deg: [0, -25, -60, -20, 0, 0]
+  display_view_deg: [0, -25, -70, -15, 0, 0]
   # 上述三个视角只填前六轴；夹爪由gripper.closed_angle_deg统一设定。
+# 261113 总流程中，每个视角找不到稳定目标后再抬头的等待秒数。
+search_timeout_s:
+  call: 10.0     # 轿厢外呼上下键
+  floor: 15.0    # 轿内楼层按键
+  display: 10.0  # LCD 当前楼层
+# 三个识别阶段共用的每次超时抬头增量，按 [J2, J3] 排列，单位度。
+search_retry_delta_deg: [-15.0, -25.0]
+robot_control:
+  # J4 的 POS_VEL 位置环增益在使能前写入并读回。1.0 对应 SDK 配置值。
+  joint4_pos_kp_scale: 0.8
+  # 保留实测过的比例项，单独降低积分项。1.0 可恢复上轮设置。
+  joint4_pos_ki_scale: 0.5
 grasp_place:
   # 261110串联入口和261113总流程：夹取成功后，将end_link移动到此处再松爪。
   # base坐标系XYZ，单位米；不叠加视觉目标偏移。--place-xyz-m可临时覆盖。
@@ -34,13 +49,18 @@ ocr:
   min_confidence: 0.70
   # 两个主入口共用：先识别亮字，再补充黑字；bright可切回原亮字流程。
   preprocessing: bright_dark
+  # 每帧最多送入 OCR 的圆环数。同键复核时优先处理目标附近圆环。
+  buttons_per_update: 6
 temporal:
+  # 面板稳定及同圆环数字确认所需的最少有效观测数。
   required: 3
+  # 时序标签缓存同时受秒数和感知处理帧数限制，任一超出即过期。
   memory_age_s: 10.0
   memory_frames: 30
 startup_view:
   # 三个识别初始视角在initial_poses中分别设置；此处仅共用运动时间与到位检查选项。
-  duration_s: 2
+  # 关节运动参考秒数，须大于 0。识别和停稳时间另计。
+  duration_s: 1.0
   # false：下发后只等上述参考时间，不轮询七轴到位；true恢复到位检查。
   wait_for_arrival: false
 gripper:
@@ -63,11 +83,32 @@ elevator:
   # 2026-11-10用户尺量后的电梯目标修正，base XYZ，单位米。
   # X=100mm实测间隙-50mm预留，Y修正右偏23.5mm，Z修正下偏13.9mm。
   # 在原手眼/base变换之后只加一次；不是工具偏移，不影响抓取模式。
-  target_offset_base_m: [0.028, 0.048, 0.0325]
-  standoff_m: 0.10
-  move_duration_s: 3.0
-  # 接近前置点时同步调平；false恢复原地调平后再平移。
+  target_offset_base_m: [0.040, 0.046, 0.038]
+  # 工具尖端到估计表面的前置距离，单位米。
+  standoff_m: 0.20
+  # 从当前位置到前置点的轨迹参考秒数。规划和到位检查另计。
+  move_duration_s: 2.0
+  # free 只约束工具尖端 XYZ。level 约束完整姿态。
+  button_orientation: free
+  # 仅单次解算且使用 level 时生效。false 会先在原地调平再接近。
   level_during_approach: true
+  # false 使用一次解算的目标接近并按压。true 到前置点后复核同键三帧。
+  refinement:
+    enabled: false
+    # 底座水平时，实测法向转到 base 后沿 XY 接近；false 保留实测三维法向。
+    vertical_panel: true
+    # 前置点 roll/pitch=0，末端 +X 水平朝向面板。false 使用此前的前置姿态策略。
+    standoff_face_panel: false
+    # 从关节停靠确认后开始，包含视觉稳定检查和三帧确认。
+    reacquire_timeout_s: 15.0
+    # 等待重新确认视角的时间
+    # 可选前置轨迹末段减速，单位秒。0 沿用原接近轨迹的速度设置。
+    standoff_brake_s: 0.0
+    # 前置和撤回到位期间的 POS_VEL 纠偏上限。
+    hold_joint_vlim_rad_s: 0.15
+    # 前置点停稳后锁定六轴。此处是保持时的 POS_VEL 速度指令上限，单位 rad/s。
+    standoff_hold_vlim_rad_s: 0.05
+    max_correction_m: 0.03
   # 261113楼层按键：已确认楼层在当前阶段持续保留；新稳定识别更新/替换，换姿态或阶段清空。
   # 当前圆环不必为绿色；执行前仍核对局部图像、深度和位姿。false恢复下方定时缓存。
   floor_cache_until_update: true
@@ -75,7 +116,8 @@ elevator:
   stable_snapshot_age_s: 2.0
   contact_duration_s: 1.5
   retreat_duration_s: 2.0
-  dwell_s: 0.4
+  # 到达接触位或配置的压入位后，回撤前保持的秒数。0 表示立即回撤。
+  dwell_s: 0.1
   press_travel_m: 0.0
   max_result_age_s: 4.0
   floor_wait_s: 5.0

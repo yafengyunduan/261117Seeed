@@ -74,7 +74,7 @@ class JourneyEntryTests(unittest.TestCase):
         self.assertEqual(options['elevator']['target_offset_base_m'],original['elevator']['target_offset_base_m'])
         self.assertIsNone(settings['call_target_offset_base_m'])
         self.assertEqual(entry.effective_call_offset(settings,options).tolist(),original['elevator']['target_offset_base_m'])
-        self.assertEqual(settings['search_timeout_s'],10.)
+        self.assertEqual(settings['search_timeout_s'],original['search_timeout_s'])
         self.assertEqual(args.floor_input_delay_s,.4)
         self.assertEqual(args.button_orientation,'free')
 
@@ -85,15 +85,81 @@ class JourneyEntryTests(unittest.TestCase):
         self.assertFalse(result['devices_created'])
         self.assertEqual(result['button_orientation'],'free');self.assertTrue(result['position_only_ik'])
         self.assertEqual(result['stages'][1:4],['七轴抬头闭合','等待C开始外呼识别','稳定两键U/D'])
-        self.assertEqual(result['search_failure_traces']['CALL'],[-15.,-15.,'HOME'])
-        self.assertEqual(result['search_failure_traces']['DISPLAY'],[-15.,-10.,'HOME'])
+        self.assertIn('等待C开始LCD识别',result['stages'])
+        for phase in ('CALL','FLOOR','DISPLAY'):
+            self.assertEqual(result['search_failure_traces'][phase],[dict(J2=-15.,J3=-25.)]*2+['HOME'])
         self.assertEqual(result['call_target_offset_base_m'],result['floor_target_offset_base_m'])
         self.assertEqual(result['floor_input_delay_s'],.4)
         self.assertEqual(result['skip_key'],'N')
-        self.assertEqual(set(result['skip_transitions']),{'WAIT_CALL','CALL','FLOOR','DISPLAY'})
+        self.assertEqual(set(result['skip_transitions']),{'WAIT_CALL','CALL','FLOOR','WAIT_DISPLAY','DISPLAY'})
+        self.assertIn('WAIT_DISPLAY',result['skip_transitions']['FLOOR'])
         self.assertIn('home',result['skip_transitions']['DISPLAY'])
         self.assertIsNone(result['floor_cache_age_s'])
         self.assertTrue(result['floor_cache_until_update'])
+
+    def test_simulation_shortens_both_retry_axes_and_rejects_out_of_limit_presets(self):
+        options=app.read_yaml(ROOT/'config/261105_my_elevator.yaml')
+        options['initial_poses']['call_view_deg'][1:3]=[-170.,-160.]
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'workflow.yaml'
+            path.write_text(yaml.safe_dump(options))
+            argv=['--workflow-config',str(path),'--simulate']
+            with patch.object(entry,'Journey',side_effect=AssertionError('device')), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(entry.main(argv),0)
+            plan=json.loads(output.getvalue())
+            steps=plan['search_failure_traces']['CALL']
+            self.assertEqual(steps[-1],'HOME');self.assertEqual(len(steps),2)
+            self.assertAlmostEqual(-170.+steps[0]['J2'],plan['arm_joint_limits_deg'][1][0],places=6)
+            self.assertAlmostEqual(-160.+steps[0]['J3'],plan['arm_joint_limits_deg'][2][0],places=6)
+            options['initial_poses']['display_view_deg'][4]=1000.
+            path.write_text(yaml.safe_dump(options))
+            with patch.object(entry,'Journey',side_effect=AssertionError('device')), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(entry.main(argv),2)
+            self.assertIn('J5 抬头目标',errors.getvalue())
+
+    def test_workflow_yaml_controls_timeouts_retry_deltas_and_single_axis_gain(self):
+        options=app.read_yaml(ROOT/'config/261105_my_elevator.yaml')
+        timeouts={'call':6.2,'floor':12.,'display':8.}
+        options['search_timeout_s']=timeouts
+        options['search_retry_delta_deg']=[-8.,-12.]
+        options['robot_control']['joint4_pos_kp_scale']=.85
+        options['robot_control']['joint4_pos_ki_scale']=.65
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'workflow.yaml'
+            path.write_text(yaml.safe_dump(options))
+            with patch.object(entry,'Journey',side_effect=AssertionError('device')), \
+                    contextlib.redirect_stdout(io.StringIO()) as stream:
+                self.assertEqual(entry.main(['--workflow-config',str(path),'--simulate']),0)
+            row=json.loads(stream.getvalue())
+        self.assertEqual(row['search_timeout_s'],timeouts)
+        self.assertEqual(row['robot_control']['joint4_pos_kp_scale'],.85)
+        self.assertEqual(row['robot_control']['joint4_pos_ki_scale'],.65)
+        for phase in ('CALL','FLOOR','DISPLAY'):
+            self.assertEqual(row['search_failure_traces'][phase],[dict(J2=-8.,J3=-12.)]*2+['HOME'])
+
+    def test_legacy_workflow_preserves_its_j3_only_retry_schedule(self):
+        options=app.read_yaml(ROOT/'config/261105_my_elevator.yaml')
+        options.pop('search_retry_delta_deg')
+        journey=app.read_yaml(ROOT/'config/261113_my_journey.yaml')
+        journey.update(call_j3_retry_deg=[-15,-15],floor_j3_retry_deg=[-15,-15],display_j3_retry_deg=[-15,-10])
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'journey.yaml'
+            path.write_text(yaml.safe_dump(journey))
+            result=entry.load_settings(path,options)
+        self.assertEqual(result['search_retry_plans']['CALL'],((0.,-15.),(0.,-15.)))
+        self.assertEqual(result['search_retry_plans']['DISPLAY'],((0.,-15.),(0.,-10.)))
+
+    def test_verbose_option_reaches_live_entry_and_restores_library_output_afterward(self):
+        for flags,enabled in (([],False),(['--verbose'],True)):
+            with self.subTest(flags=flags),patch.object(entry,'Journey') as factory:
+                def run():
+                    self.assertEqual(app.terminal_verbose(),enabled)
+                    return 0
+                factory.return_value.run.side_effect=run
+                self.assertEqual(entry.main(flags),0)
+            self.assertTrue(app.terminal_verbose())
 
     def test_invalid_coordinates_or_duration_fail_before_runtime(self):
         for args in (['--place-xyz-m','nan','0','0'],['--place-duration-s','0'],['--release-wait-s','-1'],['--standoff-m','.3'],

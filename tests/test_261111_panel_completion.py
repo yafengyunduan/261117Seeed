@@ -265,6 +265,40 @@ class RegionMemoryTests(unittest.TestCase):
         self.assertEqual(len(self.engine.recognize.call_args.args[1]),4)
         self.assertTrue(all(b.status=='SINGLE_SHOT' for b in result))
 
+    def test_second_pixel_verified_frame_can_start_ocr_before_outer_geometry_counter(self):
+        self.ocr.ready=False
+        self.run_frame(1.)
+        self.engine.recognize.assert_not_called()
+        second=self.run_frame(1.2)
+        self.engine.recognize.assert_called_once()
+        self.assertTrue(all(b.status!='STABLE' for b in second))
+
+    def test_focus_prioritizes_current_regions_and_retries_unread_target_without_adding_votes(self):
+        self.ocr.budget=1
+        self.ocr.focus_px=self.rings[-1].center
+        self.engine.recognize.side_effect=lambda image,rings,box:[v.ButtonObservation(r) for r in rings]
+        self.run_frame(1.)
+        self.run_frame(1.2)
+        for at in (1.65,1.8,2.,2.2):result=self.run_frame(at)
+        centers=[r.center for r in self.rings]
+        self.assertEqual([call.args[1][0].center for call in self.engine.recognize.call_args_list],
+                         [centers[-1],centers[-1],*centers[:3],centers[-1]])
+        self.assertTrue(all(b.text is None for b in result))
+        self.assertEqual(self.ocr.evidence['3']['ocr_observations'],0)
+
+    def test_missing_panel_uses_configured_yolo_interval_then_refresh_starts_new_capture(self):
+        args=experiment.parse_args([])
+        with patch.object(v,'ButtonOCR',return_value=self.engine):
+            detector=experiment.FastPanelPerception({},args)
+        detector.model=object()
+        image=np.zeros((120,180,3),np.uint8)
+        with patch.object(v,'find_rings',return_value=[]),patch.object(v,'detect_objects',return_value=(None,[])) as yolo:
+            for at in (1.,1.2,1.4,1.6):detector.process(image,captured_at=at)
+            self.assertEqual(yolo.call_count,2)
+            detector.request_refresh()
+            detector.process(image,captured_at=1.8)
+            self.assertEqual(yolo.call_count,3)
+
     def test_unchanged_unread_patches_back_off_after_two_failures(self):
         self.engine.recognize.side_effect=lambda image,rings,box:[v.ButtonObservation(r) for r in rings]
         self.run_frame(1.,rings=self.rings[:1]);self.run_frame(1.2,rings=self.rings[:1])

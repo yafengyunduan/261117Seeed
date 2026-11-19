@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class JourneyOffsetTests(unittest.TestCase):
     def setUp(self):
         self.options = app.load_workflow(ROOT/'config/261105_my_elevator.yaml')
+        self.options['elevator']['refinement']['enabled'] = False
         self.settings = journey.load_settings(ROOT/'config/261113_my_journey.yaml',self.options)
         self.original_floor_offset = np.asarray(self.options['elevator']['target_offset_base_m'], float)
 

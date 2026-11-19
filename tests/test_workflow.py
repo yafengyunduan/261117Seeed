@@ -33,6 +33,11 @@ class WorkflowTests(unittest.TestCase):
                 app.load_workflow('unused')
         o=self.settings();o['initial_poses']['grasp_ready']['duration']=0.
         with patch.object(app,'read_yaml',return_value=o),self.assertRaises(ValueError):app.load_workflow('unused')
+        for seconds in (-.1,float('nan'),True):
+            o=self.settings();o['initial_poses']['grasp_ready']['joint4_stage_duration_s']=seconds
+            with self.subTest(seconds=seconds),patch.object(app,'read_yaml',return_value=o), \
+                    self.assertRaisesRegex(ValueError,'joint4_stage_duration_s'):
+                app.load_workflow('unused')
 
     def test_floor_cache_retention_flag_is_boolean_and_old_configs_remain_timed(self):
         for value in (None,0,'true'):
@@ -99,15 +104,35 @@ class WorkflowTests(unittest.TestCase):
     def test_simulation_and_mode_prompt_do_not_create_robot(self):
         import json
         output=io.StringIO()
+        options=self.settings()
+        options['elevator']['refinement'].update(enabled=True,vertical_panel=True)
+        options['elevator']['standoff_m']=.20
         with patch.object(motion,"Robot",side_effect=AssertionError("hardware")),contextlib.redirect_stdout(output), \
-                patch.object(app,"load_workflow",return_value=self.settings()):
+                patch.object(app,"load_workflow",return_value=options):
             self.assertEqual(app.main(["--simulate","--floor","3"]),0)
         simulated=json.loads(output.getvalue())
         np.testing.assert_allclose(simulated["corrected_base_m"],[.45,-.0765,.4139])
-        np.testing.assert_allclose(np.asarray(simulated["targets"]["approach"])[:3,3],[.4,-.0765,.4139])
+        positions={key:np.asarray(pose)[:3,3] for key,pose in simulated['targets'].items()}
+        approach=positions['approach']-positions['surface']
+        self.assertAlmostEqual(np.linalg.norm(approach),.20)
+        self.assertAlmostEqual(approach[2],0.)
+        self.assertNotEqual(approach[1],0.)
+        np.testing.assert_allclose(positions['retreat'],positions['approach'])
         with patch("builtins.input",return_value="2"),patch.object(app,"run_elevator",return_value=0) as run:
             self.assertEqual(app.main([]),0)
         self.assertFalse(run.call_args.args[2].execute)
+
+    def test_startup_preview_limits_rgbd_reads_but_checks_quit_every_poll(self):
+        color=np.zeros((10,10,3),np.uint8)
+        camera=NS(get_frame=Mock(return_value=(color,None)))
+        draw,keys=Mock(),Mock(side_effect=[False,False,False,False,True])
+        with patch.object(app.time,'perf_counter',side_effect=[0.,.05,.10,.20,.25]):
+            callback=app.startup_preview(camera,draw,keys)
+            for _ in range(4):callback()
+            with self.assertRaises(motion.MotionCancelled):callback()
+        self.assertEqual(camera.get_frame.call_count,2)
+        self.assertEqual(draw.call_count,2)
+        self.assertEqual(keys.call_count,5)
 
     def test_check_bus_bypasses_mode_prompt_camera_and_elevator_configuration(self):
         with patch("builtins.input",side_effect=AssertionError("no prompt")), \
@@ -121,7 +146,7 @@ class WorkflowTests(unittest.TestCase):
 
     def runtime(self,execute=True,stage="approach",fail_move=False,cancel_move=False,fail_close=False,
                 cache_age=2.,combined=True,head_failure=False,initialize_gripper=True,
-                target_offset=(0.,0.,0.),base_compensation=(0.,0.,0.)):
+                target_offset=(0.,0.,0.),base_compensation=(0.,0.,0.),button_orientation='level'):
         clock=[100.]
         class Camera:
             K=np.array([[100.,0,50],[0,100.,40],[0,0,1]]);D=np.zeros(5)
@@ -145,7 +170,9 @@ class WorkflowTests(unittest.TestCase):
                 return snap,perception.FrameResult(snap.captured_at,(80,100),(5,5,95,75),"YOLOE",[b])
             def close(self):self.closed=True
         class Robot:
-            def __init__(self,*a):self.T=pose6d_to_mat4(.26,0,.192,0,-.5,0);self.moves=[];self.closed=False;self.homed=None
+            def __init__(self,*a):
+                self.T=pose6d_to_mat4(.26,0,.192,0,-.5,0)
+                self.moves=[];self.position_moves=[];self.finished=False;self.homed=None
             def start(self):pass
             def head_up(self,*a,**kw):
                 self.head_target=a[0]
@@ -156,27 +183,33 @@ class WorkflowTests(unittest.TestCase):
                 if fail_move:raise RuntimeError("IK failed")
                 self.moves.append(np.array(T).copy());self.T=np.array(T).copy()
                 if cancel_move and a[-1]():raise motion.MotionCancelled("user stop")
+            def move_position(self,tip,duration,cancelled,*,tip_offset):
+                self.position_moves.append(tip.copy())
+                target=geometry.pose_for_tip(self.T,tip,tip_offset)
+                self.move(target,duration,cancelled)
+                return target
             def stop(self):pass
-            def close(self,home=False):
-                self.closed=True;self.homed=home
-                if fail_close:raise RuntimeError("disable unconfirmed")
+            def finish_task(self,*,home):
+                self.finished=True;self.homed=home
+                if fail_close:raise RuntimeError("hold unconfirmed")
         camera=Camera();worker=Worker();robot=Robot()
         tracker=NS(panel=NS(stable=False),remembered_associations=lambda r,now:(),cached_labels=lambda **kw:())
         tracker.update=lambda *a,**kw:setattr(tracker.panel,"stable",True)
         tracker.reset=lambda:setattr(tracker.panel,"stable",False)
         args=NS(execute=execute,stage=stage,device="cpu",floor="3")
-        expected=1 if stage=="observe" else (1 if stage=="approach" else 3)+int(not combined)
+        expected=1 if stage=="observe" else (1 if stage=="approach" else 3)+int(not combined and button_orientation=='level')
         cancelled_once=[False]
         def key(delay):
             if cancel_move and robot.moves:
                 if not cancelled_once[0]:cancelled_once[0]=True;return 32
-                return ord("q")
+                return 27
             if (not execute and camera.count>=7) or (stage=="observe" and camera.count>=7) or len(robot.moves)>=expected:
                 return ord("q")
             return -1
         cfg={"camera":{"type":"realsense_d405"},"calibration":{"hand_eye_compensation_m":dict(zip("xyz",base_compensation))}}
         options=self.settings();options["elevator"].update(stable_snapshot_age_s=cache_age,level_during_approach=combined,
-                                                         target_offset_base_m=list(target_offset))
+                                                         target_offset_base_m=list(target_offset),button_orientation=button_orientation)
+        options['elevator']['refinement']['enabled']=False
         options["gripper"]["initialize"]=initialize_gripper
         if head_failure:options["startup_view"]["wait_for_arrival"]=True
         with contextlib.ExitStack() as s:
@@ -196,7 +229,7 @@ class WorkflowTests(unittest.TestCase):
             elif fail_move:
                 with self.assertRaisesRegex(RuntimeError,"IK failed"):app.run_elevator(cfg,options,args)
             elif fail_close:
-                with self.assertRaisesRegex(RuntimeError,"退出清理失败.*disable unconfirmed"):
+                with self.assertRaisesRegex(RuntimeError,"退出清理未全部确认.*hold unconfirmed"):
                     app.run_elevator(cfg,options,args)
             else:self.assertEqual(app.run_elevator(cfg,options,args),0)
         return camera,worker,robot,factory
@@ -230,7 +263,20 @@ class WorkflowTests(unittest.TestCase):
         expected=(captured_pose@np.array([0.,0.,.502,1.]))[:3]
         np.testing.assert_allclose(robot.moves[1][:3,3],expected,atol=1e-8)
         np.testing.assert_allclose(robot.moves[2],robot.moves[0])
-        self.assertTrue(camera.closed and worker.closed and robot.closed and robot.homed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished and robot.homed)
+
+    def test_single_solution_free_mode_reuses_one_target_with_no_extra_leveling(self):
+        with patch.object(geometry,'point_from_button',wraps=geometry.point_from_button) as solve, \
+                patch.object(geometry,'measure_button_surface',side_effect=AssertionError('plane fit')), \
+                patch.object(app,'reacquire_button',side_effect=AssertionError('second localization')):
+            _,_,robot,_=self.runtime(stage='contact',combined=False,button_orientation='free')
+        solve.assert_called_once()
+        captured_pose=pose6d_to_mat4(.26,0,.192,0,-.5,0)
+        point=(captured_pose@np.array([0.,0.,.502,1.]))[:3]
+        standoff=point-np.array([.05,0,0])
+        np.testing.assert_allclose(robot.position_moves,[standoff,point,standoff])
+        self.assertEqual(len(robot.moves),3)
+        np.testing.assert_allclose(robot.moves[0][:3,:3],captured_pose[:3,:3])
 
     def test_disable_cache_and_combined_move_restores_post_input_frame_and_separate_level(self):
         _,_,robot,_=self.runtime(stage="contact",cache_age=0.,combined=False)
@@ -240,23 +286,23 @@ class WorkflowTests(unittest.TestCase):
         np.testing.assert_allclose(robot.moves[2][:3,3],expected,atol=1e-8)
         np.testing.assert_allclose(robot.moves[3],robot.moves[1])
 
-    def test_runtime_fault_disconnects_without_automatic_home(self):
+    def test_runtime_fault_finishes_without_automatic_home(self):
         camera,worker,robot,_=self.runtime(fail_move=True)
-        self.assertTrue(camera.closed and worker.closed and robot.closed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished)
         self.assertFalse(robot.homed)
 
     def test_exit_failure_surfaces_and_other_resources_are_closed(self):
         camera,worker,robot,_=self.runtime(fail_close=True)
-        self.assertTrue(camera.closed and worker.closed and robot.closed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished)
 
     def test_motion_error_is_preserved_when_cleanup_also_fails(self):
         camera,worker,robot,_=self.runtime(fail_move=True,fail_close=True)
-        self.assertTrue(camera.closed and worker.closed and robot.closed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished)
 
     def test_user_stop_during_approach_never_continues_to_surface_or_homes(self):
         camera,worker,robot,_=self.runtime(stage="contact",cancel_move=True)
         self.assertEqual(len(robot.moves),1)
-        self.assertTrue(camera.closed and worker.closed and robot.closed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished)
         self.assertFalse(robot.homed)
 
     def test_observe_does_not_level_or_approach(self):
@@ -277,8 +323,8 @@ class WorkflowTests(unittest.TestCase):
     def test_gripper_arrival_failure_prevents_approach_even_with_automatic_floor(self):
         camera,worker,robot,_=self.runtime(stage="contact",head_failure=True)
         self.assertEqual(robot.moves,[])
-        self.assertTrue(camera.closed and worker.closed and robot.closed)
-        self.assertFalse(robot.homed)
+        self.assertTrue(camera.closed and worker.closed and robot.finished)
+        self.assertTrue(robot.homed)
 
     def test_skip_gripper_sends_six_targets_only(self):
         _,_,robot,_=self.runtime(stage="observe",initialize_gripper=False)

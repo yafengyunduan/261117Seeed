@@ -1,12 +1,12 @@
 {
-  "snapshot_date": "2026-11-17",
+  "snapshot_date": "2026-11-19",
   "unit_tests": {
-    "count": 460,
+    "count": 521,
     "passed": true,
-    "elapsed_s": 55.79,
-    "scope": "run from the clean export, not the original worktree"
+    "elapsed_s": 60.616,
+    "scope": "run from the clean export"
   },
-  "syntax_files": 86,
+  "syntax_files": 87,
   "simulations": {
     "261113_my_elevator_journey": 0,
     "261110_my_grasp_then_elevator": 0

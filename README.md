@@ -70,6 +70,7 @@ python scripts/261113_my_elevator_journey.py --execute --device 0 --ocr-device c
 - 抬头后 C 开始外呼识别，U/D 选择上下行。
 - 人工进入轿厢并站稳后 C 继续，输入楼层数字，停顿后自动提交，无需回车。
 - 楼层阶段已确认的缓存持续保留；`memory=[...]` 列出缓存，R 清空。执行前仍核对图像、深度和位姿。
+- 按完楼层键或按 N 跳过后，机械臂进入 LCD 观察姿态。按 C 开始识别和计时，等待 C 或识别期间按 N 回零退出。
 - Q 正常回零退出；空格/ESC 停止，不追加自动回零。
 
 完整操作、失败回零和缓存边界说明见 [操作指南](docs/journey_guide.txt)。
@@ -80,11 +81,13 @@ python scripts/261113_my_elevator_journey.py --execute --device 0 --ocr-device c
 
 - `initial_poses.grasp_ready`：夹取预备位，XYZ 米、RPY 弧度、duration 秒。
 - `initial_poses.call_view_deg`、`floor_view_deg`、`display_view_deg`：六轴绝对角度，单位度。
+- `search_timeout_s` 分别设置外呼、楼层按键和 LCD 单轮搜索时间，当前为 10、15、10 秒。
+- `search_retry_delta_deg` 设置每次超时抬头的 [J2, J3] 相对增量。当前从实测角度减 15°、减 25°，最多重试两次，各轴按 URDF 限位缩短动作。
 - `grasp_place.xyz_m`：抓取后放置点，base 坐标系 end_link XYZ，米。
 - `elevator.target_offset_base_m`：按钮目标经验补偿。
 - `elevator.floor_cache_until_update`：当前总流程的楼层持续缓存开关。
 
-`config/261113_my_journey.yaml` 管理搜索窗口、重试与识别参数。
+`config/261113_my_journey.yaml` 管理停稳检查、到站超时和 LCD 识别阈值。
 配置保留当前机器的实测调试值；坐标、工具偏移和补偿需结合实际安装核对。
 软件到达估计表面不等于已经独立确认实体按钮触发，离线测试不替代实机可达性和碰撞检查。
 

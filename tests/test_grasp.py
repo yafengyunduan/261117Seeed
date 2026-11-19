@@ -8,6 +8,25 @@ from unittest.mock import Mock,patch
 from elevator import grasp,app
 
 class GraspTests(unittest.TestCase):
+    def test_startup_selects_staged_motion_and_zero_restores_original_ready_move(self):
+        ready=app.load_workflow(app.ROOT/'config/261105_my_elevator.yaml')['initial_poses']['grasp_ready']
+        ready=dict(ready,joint4_stage_duration_s=1.5)
+        cfg={'robot':{'ready_pose':ready}}
+        robot=SimpleNamespace(move_ready_in_stages=Mock())
+        module=SimpleNamespace(_move_ready=Mock())
+        controller=object()
+        cancelled=Mock(return_value=False)
+        with patch.object(grasp,'original_motion_adapter',return_value=(module,controller)):
+            self.assertIs(grasp.enter_ready_pose(robot,cfg,cancelled),module)
+            module._move_ready.assert_not_called()
+            args=robot.move_ready_in_stages.call_args.args
+            self.assertEqual(args[0][:3,3].tolist(),[ready['x'],ready['y'],ready['z']])
+            self.assertEqual(args[1:],(ready['duration'],1.5,cancelled))
+            ready['joint4_stage_duration_s']=0.
+            self.assertIs(grasp.enter_ready_pose(robot,cfg,cancelled),module)
+            module._move_ready.assert_called_once_with(controller,ready)
+        robot.move_ready_in_stages.assert_called_once()
+
     def test_execute_calls_original_main_with_same_config(self):
         cfg={"robot":{"ready_pose":{"x":.3}}};original=SimpleNamespace(main=Mock(return_value=0))
         args=Namespace(execute=True,config=Path("config/default.yaml"))

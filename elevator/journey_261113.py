@@ -6,8 +6,6 @@ created on import. Walking/boarding is an operator handoff, not navigation.
 from __future__ import annotations
 
 import argparse
-import copy
-import json
 import math
 import multiprocessing as mp
 import os
@@ -23,34 +21,58 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from . import app, geometry, grasp, motion
+from drivers.camera.base import CameraFrameError
+from . import app, detail, geometry, grasp, motion, terminal_output, terminal_verbose
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class SearchState:
-    PLANS = {'CALL': (-15., -15.), 'FLOOR': (-15., -15.), 'DISPLAY': (-15., -10.)}
+    PHASES = ('CALL', 'FLOOR', 'DISPLAY')
+    RETRY_COUNT = 2
+    DEFAULT_RETRY_DELTA_DEG = (-15., -25.)
 
-    def __init__(self, timeout_s=10.):
-        if not math.isfinite(timeout_s) or timeout_s <= 0:
-            raise ValueError('search timeout must be positive')
-        self.timeout_s = timeout_s
+    def __init__(self, timeout_s=10., *, retry_plans=None):
+        self.retry_plans = (dict.fromkeys(self.PHASES, (self.DEFAULT_RETRY_DELTA_DEG,) * self.RETRY_COUNT)
+                            if retry_plans is None else retry_plans)
+        phase_keys={phase.lower() for phase in self.PHASES}
+        values=timeout_s if isinstance(timeout_s,dict) else dict.fromkeys(phase_keys,timeout_s)
+        if set(values)!=phase_keys:
+            raise ValueError('search_timeout_s 需要 call、floor、display 三个值')
+        self.timeouts={}
+        for phase in self.PHASES:
+            raw=values[phase.lower()]
+            message=f'search_timeout_s.{phase.lower()} 需要 1～60 秒'
+            try:
+                seconds=float(raw)
+            except (TypeError,ValueError) as exc:
+                raise ValueError(message) from exc
+            if isinstance(raw,bool) or not 1.<=seconds<=60.:
+                raise ValueError(message)
+            self.timeouts[phase]=seconds
         self.phase, self.retry_index, self.deadline = 'GRASP', 0, None
+        self.started_at = None
         self.waiting_retry = False
 
+    @property
+    def timeout_s(self):
+        return self.timeouts.get(self.phase,self.timeouts['CALL'])
+
     def enter(self, phase, now):
-        if phase not in (*self.PLANS, 'GRASP', 'WAIT_CALL', 'BOARD', 'DONE', 'TIMEOUT'):
+        if phase not in (*self.PHASES, 'GRASP', 'WAIT_CALL', 'BOARD', 'WAIT_DISPLAY', 'DONE', 'TIMEOUT'):
             raise ValueError('unknown phase')
         self.phase, self.retry_index = phase, 0
         self.waiting_retry = False
-        self.deadline = now+self.timeout_s if phase in self.PLANS else None
+        self.started_at = now if phase in self.PHASES else None
+        self.deadline = now+self.timeout_s if phase in self.PHASES else None
 
     def retry_complete(self, now):
         self.waiting_retry = False
+        self.started_at = now
         self.deadline = now+self.timeout_s
 
     def tick(self, now, ready):
-        if self.phase not in self.PLANS or self.waiting_retry:
+        if self.phase not in self.PHASES or self.waiting_retry:
             return None
         if ready:
             self.deadline = None
@@ -59,24 +81,37 @@ class SearchState:
             self.deadline = now+self.timeout_s
         if now < self.deadline:
             return None
-        if self.retry_index == 2:
+        if self.retry_index == self.RETRY_COUNT:
             self.phase, self.deadline = 'TIMEOUT', None
             return 'HOME'
-        delta = self.PLANS[self.phase][self.retry_index]
+        delta = self.retry_plans[self.phase][self.retry_index]
         self.retry_index += 1
         self.deadline, self.waiting_retry = None, True
         return delta
 
 
-def relative_j3_target(robot, delta, j3_bounds=(-3.14, 0.)):
-    q = np.asarray(robot.arm.get_state()[0][:6], float)
-    if q.shape != (6,) or not np.isfinite(q).all() or not math.isfinite(delta):
-        raise ValueError('invalid joint feedback/delta')
-    goal = np.degrees(q)
-    goal[2] += delta
-    if not j3_bounds[0] <= np.radians(goal[2]) <= j3_bounds[1]:
-        raise ValueError(f'J3 target outside URDF limits: {goal[2]:.3f}deg')
-    return goal
+def relative_head_target(joints_deg, delta_deg, limits, *, last_goal_deg=None):
+    """Apply a J2/J3 step within URDF limits, holding the other axes at feedback."""
+    q = np.asarray(joints_deg, float)
+    delta = np.asarray(delta_deg, float)
+    if q.shape != (6,) or delta.shape != (2,) or not np.isfinite(q).all() or not np.isfinite(delta).all():
+        raise ValueError('抬头重试需要六轴有效反馈和 J2/J3 两个有限角度增量')
+
+    lower, upper = np.degrees(limits[1:3]).T
+    current = q[1:3]
+    proposed = np.clip(current + delta, lower, upper)
+    advances = np.sign(delta) * (proposed - current) > 1e-9
+    new_view = advances.copy()
+    if last_goal_deg is not None:
+        boundary = np.where(delta < 0, lower, upper)
+        at_last_boundary = (proposed == boundary) & np.isclose(last_goal_deg[1:3], boundary, rtol=0., atol=1e-9)
+        new_view &= ~at_last_boundary  # Lagging feedback does not create another search at the same limit.
+    if not new_view.any():
+        return None
+
+    goal = q.copy()
+    goal[1:3] = np.where(advances, proposed, current)
+    return np.degrees(motion.checked_head_goal(goal, limits))
 
 
 def shared_display_ocr(detector):
@@ -92,21 +127,24 @@ def shared_display_ocr(detector):
 
 def _worker(connection, requests, cfg, settings, journey):
     try:
+        began=time.perf_counter()
         from .panel_261112 import FastPanelPerception
         from .call_panel_261112 import CallPanelDetector
         from .floor_display_261113 import FloorDisplayReader
         panel = FastPanelPerception(cfg, argparse.Namespace(**settings))
         call = CallPanelDetector(required=3)
         display = FloorDisplayReader(shared_display_ocr(panel), min_confidence=journey['display_min_confidence'])
+        initialized=time.perf_counter()
         panel.warmup(cfg['camera'].get('color_height', 720), cfg['camera'].get('color_width', 1280))
-        print('[Journey OCR shared] '+json.dumps(panel.ocr.backend_info, ensure_ascii=False), flush=True)
+        with terminal_output(settings.get('verbose',True)):
+            app.report_vision_ready(panel.ocr.backend_info,began,initialized)
         connection.send(('ready',))
         previous = None
         while True:
             request = requests.get()
             if request is None:
                 break
-            kind, frame_id, at, color, depth, K, generation = request
+            kind, frame_id, at, color, depth, K, generation, focus_px = request
             if previous != (kind, generation):
                 panel.request_refresh(); call.reset(); display.reset()
                 previous = (kind, generation)
@@ -118,7 +156,7 @@ def _worker(connection, requests, cfg, settings, journey):
                 result = estimate_grasps(results, depth, K,
                     depth_quantile=float(cfg.get('grasp_pipeline', {}).get('grasp', {}).get('depth_quantile', .75)))
             elif kind == 'panel':
-                result = panel.process(color, captured_at=at)
+                result = panel.process(color, captured_at=at, focus_px=focus_px)
             elif kind == 'call':
                 result = call.process(color, captured_at=at, generation=generation)
             elif kind == 'display':
@@ -138,6 +176,8 @@ def _worker(connection, requests, cfg, settings, journey):
 
 
 class JourneyWorker(app.PerceptionWorker):
+    KINDS=('grasp','panel','call','display')
+
     def __init__(self, cfg, settings, journey):
         ctx = mp.get_context('spawn')
         self.connection, child = ctx.Pipe()
@@ -146,35 +186,46 @@ class JourneyWorker(app.PerceptionWorker):
         self.process.start(); child.close()
         self.pending, self.submitted_at, self.timeout = None, 0., 20.
 
-    def submit(self, snapshot, kind='panel'):
-        if kind not in ('grasp', 'panel', 'call', 'display'):
-            raise ValueError('unknown inference task')
-        if self.pending is None:
-            self.requests.put_nowait((kind, snapshot.frame_id, snapshot.captured_at, snapshot.color,
-                                     snapshot.depth_mm if kind == 'grasp' else None,
-                                     snapshot.K if kind == 'grasp' else None, snapshot.generation))
-            self.pending, self.submitted_at = snapshot, time.perf_counter()
+
+def retry_angle_pair(raw, key):
+    message = f'{key} 需要两个有限角度，单位度'
+    try:
+        angles = np.asarray(raw, float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if angles.shape != (2,) or not np.isfinite(angles).all() or any(isinstance(angle, bool) for angle in raw):
+        raise ValueError(message)
+    return tuple(angles.tolist())
 
 
 def load_settings(path, options=None):
     value = app.read_yaml(path)
-    for name, lo, hi in (('search_timeout_s', 1., 60.), ('settle_s', .1, 2.), ('max_settle_s', 1., 15.),
+    workflow = options or {}
+    value['search_timeout_s']=workflow.get('search_timeout_s',value.get('search_timeout_s',10.))
+    retry_key = 'search_retry_delta_deg'
+    legacy_keys = {phase: f'{phase.lower()}_j3_retry_deg' for phase in SearchState.PHASES}
+    if retry_key not in workflow and any(key in value for key in legacy_keys.values()):
+        # Older workflow/journey backup pairs retain their J3-only schedules.
+        value['search_retry_plans'] = {
+            phase: tuple((0., step) for step in retry_angle_pair(value.get(key), key))
+            for phase, key in legacy_keys.items()
+        }
+    else:
+        step = retry_angle_pair(workflow.get(retry_key, SearchState.DEFAULT_RETRY_DELTA_DEG), retry_key)
+        value['search_retry_plans'] = dict.fromkeys(SearchState.PHASES, (step,) * SearchState.RETRY_COUNT)
+    SearchState(value['search_timeout_s'], retry_plans=value['search_retry_plans'])
+    for name, lo, hi in (('settle_s', .1, 2.), ('max_settle_s', 1., 15.),
                          ('arrival_timeout_s', 10., 3600.), ('max_observation_age_s', .1, 2.),
                          ('display_min_confidence', .5, 1.)):
         number = float(value[name])
         if not math.isfinite(number) or not lo <= number <= hi:
             raise ValueError(f'invalid {name}')
         value[name] = number
-    # The requested retry schedules are explicit, not accumulated across stages.
-    for key, plan in (('call_j3_retry_deg', [-15, -15]), ('floor_j3_retry_deg', [-15, -15]),
-                      ('display_j3_retry_deg', [-15, -10])):
-        if value[key] != plan:
-            raise ValueError(f'{key} expected {plan}')
     # Current workflows have one pose source. Older custom journey files can
     # still supply their display pose when no shared initial_poses is present.
-    initial=(options or {}).get('initial_poses',{})
+    initial=workflow.get('initial_poses',{})
     head = np.asarray(initial.get('display_view_deg',value.get('display_view_deg')), float)
-    if head.shape != (6,) or not np.isfinite(head).all() or not -179.9 <= head[2] <= 0:
+    if head.shape != (6,) or not np.isfinite(head).all():
         raise ValueError('invalid display pose; configure initial_poses.display_view_deg in workflow-config')
     value['display_view_deg']=head.tolist()
     if value.get('call_target_offset_base_m') is not None:
@@ -205,6 +256,7 @@ def display_floor_id(value):
 class Journey:
     """Blocking robot actions, responsive cancellation; single inference task."""
     KINDS = {'GRASP': 'grasp', 'CALL': 'call', 'FLOOR': 'panel', 'DISPLAY': 'display'}
+    SKIP_PHASES = ('WAIT_CALL', 'CALL', 'FLOOR', 'WAIT_DISPLAY', 'DISPLAY')
 
     def __init__(self, cfg, options, settings, args):
         self.cfg, self.options, self.settings, self.args = app.apply_initial_poses(cfg,options), options, settings, args
@@ -212,15 +264,16 @@ class Journey:
         self.views={'CALL':list(initial.get('call_view_deg',options['startup_view']['joints_deg'][:6])),
                     'FLOOR':list(initial.get('floor_view_deg',options['startup_view']['joints_deg'][:6])),
                     'DISPLAY':list(initial.get('display_view_deg',settings['display_view_deg']))}
-        self.state = SearchState(settings['search_timeout_s'])
+        self.state = SearchState(settings['search_timeout_s'], retry_plans=settings.get('search_retry_plans'))
         self.robot = self.camera = self.worker = None
-        self.window = 'Elevator journey | G/N -> C -> U/D -> C -> floor -> arrival'
+        self.window = 'Elevator journey | G/N -> C -> U/D -> C -> floor/N -> C -> LCD'
         self.display = self.last = self.last_snapshot = None
         self.call_cache = None
         self.floor_cache = {}
         self.grasp_view = None
         self.rendered_result = self.rendered_panel = None
         self.generation = self.frame_id = self.failures = 0
+        self.recognition_logged_generation = None
         self.tracker = app._tracker(options)
         self.request = None; self.typed = ''; self.floor = None
         self.floor_input_due = None
@@ -236,9 +289,11 @@ class Journey:
         self.skip_position_only = False
         self.button_orientation = getattr(args,'button_orientation','level')
         self.preview_q = np.array(self.views['CALL'], float)
+        self.preview_limits = None
 
-    def log(self, message):
-        print(f'[Journey:{self.state.phase}] {message}', flush=True)
+    def log(self, message, *, verbose_only=False):
+        printer=detail if verbose_only else print
+        printer(f'[Journey:{self.state.phase}] {message}', flush=True)
 
     def cancelled(self):
         if self.display is not None:
@@ -262,7 +317,7 @@ class Journey:
             self.skip_requested = False
             return True
         if ((key in (ord('n'), ord('N')) or value is not None and value.lower() == 'n')
-                and self.state.phase in ('WAIT_CALL', 'CALL', 'FLOOR', 'DISPLAY') and not self.skip_in_progress):
+                and self.state.phase in self.SKIP_PHASES and not self.skip_in_progress):
             self.skip_requested = True
             self.quit_home_requested = False
             return True
@@ -281,24 +336,31 @@ class Journey:
         self.restore_terminal()
         self.arrival_deadline = None
         self.state.enter('BOARD', time.perf_counter())
-        self.log('等待人工进入轿厢、停在面板前并站稳；按 C 继续。接近模式需人工处理实际呼叫。')
+        text='到轿厢面板前站稳后按 C。'
+        if self.args.press_stage=='approach':text='人工呼叫电梯。'+text
+        self.log(text)
 
     def enter_display(self, floor):
         self.floor = floor
+        self.arrival_deadline = None
+        self.state.enter('WAIT_DISPLAY', time.perf_counter())
         self.head(self.views['DISPLAY'])
+        self.enable_floor_terminal()
+        self.log('按 C 开始识别当前楼层，N 跳过观察并回零退出。')
+
+    def begin_display(self):
+        self.invalidate(); self.settle()
         self.state.enter('DISPLAY', time.perf_counter())
-        if floor is None:
-            self.arrival_deadline = None
-            self.enable_floor_terminal()
+        if self.floor is None:
             self.log('开始LCD楼层识别；请输入到站目标楼层（仅用于显示比较），无需回车；N回零退出。')
         else:
             self.restore_terminal()
             self.arrival_deadline = time.perf_counter()+self.settings['arrival_timeout_s']
-            self.log(f'等待独立稳定的当前楼层={floor}；N跳过识别并回零退出。')
+            self.log(f'等待独立稳定的当前楼层={self.floor}；N跳过识别并回零退出。')
 
     def skip_stage(self):
         phase = self.state.phase
-        if phase not in ('WAIT_CALL', 'CALL', 'FLOOR', 'DISPLAY') or self.skip_in_progress:return False
+        if phase not in self.SKIP_PHASES or self.skip_in_progress:return False
         target = self.floor
         if phase == 'FLOOR':
             raw = self.typed or (self.request['value'] if self.request is not None else target)
@@ -331,19 +393,19 @@ class Journey:
                 self.log('N跳过外呼，恢复抬头后进入人工进轿厢交接。')
                 self.enter_board()
             elif phase == 'FLOOR':
-                self.log('N跳过楼层按键，转入当前楼层显示识别。')
+                self.log('N跳过楼层按键，转到 LCD 观察姿态。')
                 self.enter_display(target)
             else:
                 self.restore_terminal()
                 self.home = True
                 self.state.enter('DONE', time.perf_counter())
-                self.log('N跳过最后的LCD识别阶段，回零退出。' if self.robot is not None else 'N跳过最后的LCD识别阶段，退出预览。')
+                self.log('N跳过最后的LCD识别阶段，自动回零退出。' if self.robot is not None else 'N跳过最后的LCD识别阶段，退出预览。')
         finally:
             self.skip_in_progress = False
         return True
 
     def enable_floor_terminal(self):
-        """Only the floor stage uses per-key terminal input; restore on leaving."""
+        """Read floor digits and the LCD handoff key without Enter."""
         if self.terminal_state is not None or not sys.stdin.isatty():
             return
         try:
@@ -381,43 +443,71 @@ class Journey:
         if self.camera is not None:
             self.camera.warm_up(3)
 
-    def snapshot(self):
+    def snapshot(self, *, with_arm_feedback=False):
         color, depth = self.camera.get_frame()
         if color is None or depth is None:
             self.failures += 1
             if self.failures >= 15:
-                raise RuntimeError('连续15次RGB-D获取失败')
+                raise CameraFrameError('连续15次RGB-D获取失败')
             return None
         self.failures = 0; self.frame_id += 1
-        pose = np.eye(4) if self.robot is None else self.robot.pose()
+        feedback = None
+        if self.robot is None:
+            pose = np.eye(4)
+        elif with_arm_feedback:
+            pose,feedback = self.robot.pose_with_feedback()
+        else:
+            pose = self.robot.pose()
         return geometry.Snapshot(self.frame_id, time.perf_counter(), color.copy(), depth.copy(),
-                                 self.K, self.D, pose, self.generation)
+                                 self.K, self.D, pose, self.generation,arm_feedback=feedback)
 
     def settle(self):
-        until = time.perf_counter()+self.settings['max_settle_s']
+        began = time.perf_counter()
+        limit = self.settings['max_settle_s']
+        until = began+limit
         since = anchor = None
+        peak_m = peak_deg = 0.
+        frames = 0
         while time.perf_counter() < until:
             snap = self.snapshot()
             if snap is not None:
+                if snap.captured_at>=until:break
+                frames += 1
                 self.display = snap.color.copy()
                 if anchor is None:
                     anchor, since = snap.T_base_end, snap.captured_at
-                angle = np.arccos(np.clip((np.trace(anchor[:3, :3].T@snap.T_base_end[:3, :3])-1)/2, -1, 1))
-                if np.linalg.norm(anchor[:3, 3]-snap.T_base_end[:3, 3]) > .002 or angle > np.radians(.5):
+                delta,angle = geometry.pose_difference(anchor,snap.T_base_end)
+                peak_m,peak_deg=max(peak_m,delta),max(peak_deg,np.degrees(angle))
+                if delta > .002 or angle > np.radians(.5):
                     anchor, since = snap.T_base_end, snap.captured_at
                 if snap.captured_at-since >= self.settings['settle_s']:
+                    self.log(f'[Settle] wait_s={snap.captured_at-began:.2f} '
+                             f'peak_window_mm={peak_m*1000:.1f} peak_window_deg={peak_deg:.2f}',verbose_only=True)
                     return
+            else:since=anchor=None
             if self.cancelled():
                 raise motion.MotionCancelled('用户停止')
-        raise TimeoutError(f'六轴反馈未静止；未开始{self.state.timeout_s:g}秒识别窗口')
+        reason = '六轴反馈未停稳' if frames else '无可用RGB-D'
+        raise TimeoutError(f'{reason}（{limit:g}s）；反馈窗口最大位姿变化 '
+                           f'{peak_m*1000:.1f} mm / {peak_deg:.2f}°；未开始{self.state.timeout_s:g}秒识别窗口')
+
+    def arm_view_limits(self):
+        if self.robot is not None:
+            return self.robot.arm_position_limits()
+        if self.preview_limits is None:
+            self.preview_limits = motion.configured_arm_position_limits(self.cfg)
+        return self.preview_limits
 
     def head(self, joints):
-        self.preview_q = np.asarray(joints[:6], float).copy()
+        joints = np.asarray(joints[:6],float)
         if self.robot is not None:
-            values = list(joints[:6])+[self.options['gripper']['closed_angle_deg']]
+            values = joints.tolist()+[self.options['gripper']['closed_angle_deg']]
             self.robot.head_up(values, self.options['startup_view']['duration_s'], self.cancelled,
                                closed_tolerance=self.options['gripper']['closed_tolerance_rad'],
                                wait_for_arrival=self.options['startup_view']['wait_for_arrival'])
+        else:
+            motion.checked_head_goal(joints,self.arm_view_limits())
+        self.preview_q = joints.copy()
         self.invalidate(); self.settle()
 
     def begin_call(self):
@@ -426,7 +516,7 @@ class Journey:
         self.head(self.views['CALL'])
         # No inference kind or search deadline until the operator confirms.
         self.state.enter('WAIT_CALL', time.perf_counter())
-        self.log('已恢复抬头姿态；按 C 开始识别上行/下行外呼面板。等待期间不计搜索超时；Q回零退出。')
+        self.log('按 C 搜寻外呼面板，Q 回零退出。')
 
     def fresh(self, now):
         return (self.last is not None and self.last_snapshot is not None
@@ -617,7 +707,7 @@ class Journey:
             message=str(exc).rstrip('。；')
             self.log(message+('。' if '请等待或重新输入' in message else '；请等待或重新输入。')); return
         self.request = dict(value=value, at=now)
-        self.log(f'已选择楼层{value}；自动提交，核对已确认缓存及当前场景后执行；无需当前圆环为绿色。')
+        self.log(f'已选择 {value} 楼。')
 
     def commit_floor_input(self, now):
         if self.floor_input_due is not None and now >= self.floor_input_due:
@@ -626,6 +716,8 @@ class Journey:
     def press(self, current):
         if self.request is None or not self.ready(current.captured_at):
             return False
+        settings = self.options['elevator']
+        surface = None
         try:
             if self.state.phase == 'CALL':
                 snap, button, source = self.resolve_call(current)
@@ -636,30 +728,57 @@ class Journey:
                 snap, button, source = self.resolve_floor(current)
                 compensation = self.options['elevator']['target_offset_base_m']
                 compensation_source = 'elevator.target_offset_base_m'
-            camera_point, base = geometry.point_from_button(snap, button, self.hand_eye, self.cfg)
+            if self.robot is not None and settings.get('refinement',{}).get('enabled',False):
+                surface = geometry.measure_button_surface(snap,button,self.hand_eye,self.cfg,
+                                                          vertical_panel=settings['refinement']['vertical_panel'])
+                camera_point,base = surface.point_camera,surface.point_base
+            else:
+                camera_point,base = geometry.point_from_button(snap,button,self.hand_eye,self.cfg)
             point = geometry.offset_target_base(base, compensation)
         except ValueError as exc:
-            if current.captured_at-self.request.get('reported', -math.inf) >= 1.:
+            reported=self.request.get('reported')
+            if reported is None or terminal_verbose() and current.captured_at-reported>=1.:
                 self.log(str(exc)); self.request['reported'] = current.captured_at
             return False
-        self.log(f"target={self.request['value']} source={source} image_age_s={current.captured_at-snap.captured_at:.3f} "
-                 f"rim={button.ring.center} camera_m={camera_point.tolist()} "
-                 f"raw_base_m={None if base is None else base.tolist()} offset_source={compensation_source} "
-                 f"offset_base_m={np.asarray(compensation).tolist()} corrected_base_m={None if point is None else point.tolist()}")
+        if terminal_verbose():
+            self.log(f"target={self.request['value']} source={source} image_age_s={current.captured_at-snap.captured_at:.3f} "
+                     f"rim={button.ring.center} camera_m={camera_point.tolist()} "
+                     f"raw_base_m={None if base is None else base.tolist()} offset_source={compensation_source} "
+                     f"offset_base_m={np.asarray(compensation).tolist()} corrected_base_m={None if point is None else point.tolist()}")
+        else:
+            label={'U':'上行','D':'下行'}.get(self.request['value'],self.request['value']+'楼')
+            self.log(f'已定位{label}按键'+('，开始接近。' if self.robot is not None else '。'))
         if self.robot is not None:
             start_pose = self.robot.pose()
             position_only = self.button_orientation=='free'
-            level = start_pose if position_only else geometry.level_pose(start_pose, self.options['tool']['tip_offset_in_end_m'])
-            poses = geometry.button_poses(point, level, self.options['tool']['tip_offset_in_end_m'],
-                self.options['elevator']['standoff_m'], self.options['elevator']['press_travel_m'],
-                forward_base=geometry.horizontal_approach_direction(level) if position_only else None)
-            self.skip_retreat = poses['retreat']
+            offset = self.options['tool']['tip_offset_in_end_m']
             self.skip_start_pose = start_pose.copy()
             self.skip_position_only = position_only
             try:
-                app.execute_button(self.robot, point, level, self.options['elevator'],
-                                   self.options['tool']['tip_offset_in_end_m'], self.args.press_stage, self.cancelled,
-                                   **({'position_only':True} if position_only else {}))
+                if surface is not None:
+                    selected = self.request['value']
+                    kind = self.KINDS[self.state.phase]
+                    def capture():
+                        snapshot = self.snapshot(with_arm_feedback=True)
+                        if snapshot is not None:self.display = snapshot.color.copy()
+                        return snapshot
+                    def refresh():
+                        self.generation += 1
+                        self.last = self.last_snapshot = None
+                        self.tracker.reset()
+                        return app.reacquire_button(capture,self.worker,kind,selected,self.options,
+                            self.hand_eye,self.cfg,self.cancelled,generation=self.generation,
+                            settle_s=self.settings['settle_s'],hint_point_base=surface.point_base)
+                    app.execute_refined_button(self.robot,surface,settings,offset,self.args.press_stage,refresh,
+                        self.cancelled,position_only=position_only,target_offset=compensation,
+                        remember_retreat=lambda pose:setattr(self,'skip_retreat',pose.copy()))
+                else:
+                    level = start_pose if position_only else geometry.level_pose(start_pose,offset)
+                    poses = geometry.button_poses(point,level,offset,settings['standoff_m'],settings['press_travel_m'],
+                        forward_base=geometry.horizontal_approach_direction(level) if position_only else None)
+                    self.skip_retreat = poses['retreat']
+                    app.execute_button(self.robot,point,level,settings,offset,self.args.press_stage,self.cancelled,
+                                       **({'position_only':True} if position_only else {}))
             except motion.MotionCancelled:
                 if not self.skip_requested:
                     self.skip_retreat = self.skip_start_pose = None
@@ -707,7 +826,7 @@ class Journey:
     def key(self, key, now):
         text = str(key).upper()
         phase = self.state.phase
-        if text == 'N' and phase in ('WAIT_CALL', 'CALL', 'FLOOR', 'DISPLAY'):
+        if text == 'N' and phase in self.SKIP_PHASES:
             self.skip_stage(); return
         if text == 'R' and phase == 'FLOOR':
             self.invalidate(); self.settle()
@@ -724,14 +843,16 @@ class Journey:
             # Keep the head posture; start the search timer only after settling.
             self.invalidate(); self.settle()
             self.state.enter('CALL', time.perf_counter())
-            self.log('开始外呼面板识别；稳定后 U=上行，D=下行；机身须站稳。')
+            self.log('搜寻外呼面板。U 上行，D 下行，N 跳过。')
         elif phase == 'BOARD' and text == 'C':
             # CALL already restored the floor-button view. Boarding must
             # invalidate all visual evidence without repeating the same move.
             self.invalidate(); self.settle()
             self.state.enter('FLOOR', time.perf_counter())
             self.enable_floor_terminal()
-            self.log(f'在窗口或终端输入楼层，无需回车；停顿{self.floor_input_delay_s:g}秒自动提交，支持负数及两位数。')
+            self.log(f'输入楼层，停顿 {self.floor_input_delay_s:g} 秒自动提交。N 跳过。')
+        elif phase == 'WAIT_DISPLAY' and text == 'C':
+            self.begin_display()
         elif phase == 'CALL' and text in ('U', 'D'):
             if self.ready(now):
                 if self.fresh(now) and self.last.state == 'STABLE' and len(self.last.pair) == 2:
@@ -763,14 +884,22 @@ class Journey:
         if snap.generation != self.generation or not 0 <= now-snap.captured_at <= self.settings['max_observation_age_s']:
             return
         self.last_snapshot, self.last = snap, result
+        confirmed = None
         if self.state.phase == 'CALL':
             if result.state == 'STABLE' and len(result.pair) == 2:
                 self.call_cache = snap, result
+                confirmed = '外呼上下键'
             elif result.state in ('EXTRA_BUTTONS', 'AMBIGUOUS', 'CLUTTERED', 'INVALID_FRAME', 'INVALID_TIMESTAMP'):
                 self.call_cache = None
-        if self.state.phase == 'FLOOR':
+        elif self.state.phase == 'FLOOR':
             self.tracker.update(result, self.generation, camera_pose=snap.T_base_end, now=now)
             self.remember_floors(snap, result, now)
+            if self.floor_cache:
+                confirmed = f'首批楼层 {sorted(self.floor_cache)}'
+        if (confirmed is not None and self.state.started_at is not None
+                and self.recognition_logged_generation != self.generation):
+            self.log(f'{confirmed}已确认，用时 {now-self.state.started_at:.2f} 秒。')
+            self.recognition_logged_generation = self.generation
 
     def draw(self, current):
         from . import perception
@@ -800,6 +929,7 @@ class Journey:
         controls = {
             'WAIT_CALL': 'C=start UP/DOWN detection N=skip call | no search timeout',
             'BOARD': 'C=boarded and stationary; continue to floor buttons',
+            'WAIT_DISPLAY': f'C=start LCD detection N=home/exit | target={self.floor}',
         }.get(self.state.phase, f'G=grasp N=skip U/D=call | input={self.typed} target={self.floor}')
         if self.state.phase == 'CALL':
             saved = self.call_memory(current.captured_at)
@@ -808,11 +938,12 @@ class Journey:
         elif self.state.phase == 'FLOOR':
             remaining_input = '-' if self.floor_input_due is None else f'{max(0,self.floor_input_due-current.captured_at):.1f}s'
             mode='until update' if self.floor_cache_age_limit() is None else 'timed'
-            controls = f'floor digits=auto N=skip R=clear | input={self.typed} submit={remaining_input} memory={sorted(self.floor_memory(current.captured_at))} ({mode})'
+            controls = f'floor digits=auto N=skip press R=clear | input={self.typed} submit={remaining_input} memory={sorted(self.floor_memory(current.captured_at))} ({mode})'
         elif self.state.phase == 'DISPLAY':
             controls = (f'LCD arrival target digits=auto | input={self.typed} N=home/exit' if self.floor is None
                         else f'LCD arrival target={self.floor} | N=skip LCD and home/exit')
-        lines = [f"JOURNEY {self.state.phase} | retry={self.state.retry_index}/2 search={remaining} | {'EXECUTE' if self.robot else 'PREVIEW'}",
+        lines = [f"JOURNEY {self.state.phase} | retry={self.state.retry_index}/{self.state.RETRY_COUNT} "
+                 f"search={remaining} | {'EXECUTE' if self.robot else 'PREVIEW'}",
                  controls,
                  f'press={self.args.press_stage} | Q=home/exit SPACE/ESC=stop']
         for i, line in enumerate(lines):
@@ -827,37 +958,44 @@ class Journey:
         from utils.camera_utils import load_hand_eye
         ocr = self.options['ocr']
         infer = dict(device=self.args.device, roi=None, max_side=1200, geometry_only=False, ocr_threads=2,
+                     verbose=terminal_verbose(),
                      ocr_min_score=ocr['min_confidence'], ocr_device=ocr['device'], ocr_preprocessing=ocr['preprocessing'],
                      ocr_gpu_index=ocr['gpu_index'], ocr_model_dir=ROOT/ocr['model_dir'], workflow_evidence=True,
                      ocr_buttons_per_update=ocr.get('buttons_per_update',4), ocr_refresh_s=ocr.get('refresh_s',2.))
         try:
-            self.log('初始化共享YOLO/CUDA OCR，完成后才开始阶段计时。')
+            began=time.perf_counter()
+            self.log('初始化相机和识别。')
             self.worker = JourneyWorker(self.cfg, infer, self.settings)
+            camera_began=time.perf_counter()
             self.camera = make_camera(self.cfg); self.camera.open()
+            camera_ready=time.perf_counter()
+            self.log(f'[Startup] camera_open_s={camera_ready-camera_began:.2f}',verbose_only=True)
             self.K, self.D = np.asarray(self.camera.K).copy(), np.asarray(self.camera.D).copy()
             cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
-            def initializing():
-                snap = self.snapshot()
-                if snap is not None:
-                    self.display = snap.color.copy()
-                    cv2.putText(self.display, 'Loading shared YOLO/OCR | Q=exit', (8,32),
-                                cv2.FONT_HERSHEY_SIMPLEX, .6, (0,255,255), 2)
-                if self.cancelled():
-                    raise motion.MotionCancelled('初始化取消')
-            self.worker.wait_ready(on_wait=initializing)
+            def show_startup(color):
+                self.display=color.copy()
+                cv2.putText(self.display, 'Loading shared YOLO/OCR | Q=exit', (8,32),
+                            cv2.FONT_HERSHEY_SIMPLEX, .6, (0,255,255), 2)
+            self.worker.wait_ready(on_wait=app.startup_preview(self.camera,show_startup,self.cancelled))
+            self.log(f'[Startup] vision_remaining_s={time.perf_counter()-camera_ready:.2f} '
+                     f'vision_and_camera_s={time.perf_counter()-began:.2f}',verbose_only=True)
             self.hand_eye = None
             self.place = grasp.placement_pose(self.cfg, self.args.place_xyz_m, self.args.place_rpy_deg)
             if self.args.execute:
                 self.hand_eye, mode = load_hand_eye(ROOT, str(self.cfg['camera']['type']).lower())
                 if self.hand_eye is None or mode != 'eye_in_hand' or np.asarray(self.hand_eye).shape != (4,4) or not np.isfinite(self.hand_eye).all():
                     raise RuntimeError('需要有效eye_in_hand手眼标定')
-                cfg = copy.deepcopy(self.cfg); cfg['trajectory'] = self.options['trajectory']
-                self.robot = motion.Robot(cfg); self.robot.start(gripper_posvel=False)
-                self.log('进入原夹取预备姿态，完成后等待G抓放或N跳过。')
-                module, controller = grasp.original_motion_adapter(self.robot, self.cancelled)
-                module._move_ready(controller, grasp.ready_settings(self.cfg))
+                robot_cfg=app.robot_runtime_config(self.cfg,self.options)
+                self.robot = motion.Robot(robot_cfg); self.robot.start(gripper_posvel=False)
+                self.log('移动到夹取预备位。')
+                pose_began=time.perf_counter()
+                self.grasp_view = grasp.enter_ready_pose(self.robot,self.cfg,self.cancelled)
+                pose_reached=time.perf_counter()
                 self.invalidate(); self.settle()
-            self.log(f'G抓取后放置，N跳过；机械狗须站稳。{self.state.timeout_s:g}秒计时不含模型初始化和动作。')
+                self.log(f'[Startup] ready_move_s={pose_reached-pose_began:.2f} '
+                         f'ready_settle_s={time.perf_counter()-pose_reached:.2f} '
+                         f'total_ready_s={time.perf_counter()-began:.2f}',verbose_only=True)
+            self.log('G抓放，N跳过。')
             while True:
                 if self.state.phase == 'DONE':return 0
                 current = self.snapshot()
@@ -868,33 +1006,8 @@ class Journey:
                     continue
                 now = current.captured_at
                 self.receive(now)
-                if self.state.phase == 'GRASP':
-                    self.pick(current)
-                    if current.generation != self.generation: continue
-                if self.request is not None:
-                    if self.stage_action(self.press, current): continue
-                    if self.request is None:continue
-                    if now-self.request['at'] > self.options['elevator']['floor_wait_s']:
-                        self.log('本次请求定位超时，请重新选择；未使用旧三维目标。'); self.request = None
-                if self.state.phase == 'DISPLAY' and self.ready(now):
-                    if self.floor is not None and display_floor_id(self.last.current_floor) == self.floor:
-                        self.log(f'LCD稳定显示目标楼层 {self.floor}，按任务条件回零退出；未判定停车或开门。')
-                        self.home = True; self.state.enter('DONE', now); return 0
-                if self.arrival_deadline is not None and now >= self.arrival_deadline:
-                    self.log('等待到站超时，回零退出。'); self.home = True; return 2
-                delta = self.state.tick(now, self.ready(now))
-                if delta == 'HOME':
-                    self.log('三轮均无可靠面板，回零退出。'); self.home = True; return 2
-                if delta is not None:
-                    if self.robot is not None:
-                        goal = relative_j3_target(self.robot, delta)
-                    else:
-                        goal = self.preview_q.copy(); goal[2] += delta
-                    self.log(f'{self.state.timeout_s:g}秒无稳定面板，相对当前J3 {delta:g}deg，目标六轴={goal.tolist()}')
-                    phase = self.state.phase
-                    self.stage_action(self.head, goal)
-                    if self.state.phase == phase:self.state.retry_complete(time.perf_counter())
-                    continue
+                queued_request=self.request
+                # Consume N/Q before dispatching a queued button press or head retry.
                 self.draw(current)
                 key = cv2.waitKey(1) & 255
                 if key in (27,32) or cv2.getWindowProperty(self.window,cv2.WND_PROP_VISIBLE) < 1:
@@ -902,63 +1015,78 @@ class Journey:
                     raise motion.MotionCancelled('用户停止')
                 if key in (ord('q'),ord('Q')):
                     self.quit_home_requested = True
-                    raise motion.MotionCancelled('Q回零退出')
+                    raise motion.MotionCancelled('Q回零结束任务')
                 if key in (10,13): self.stage_action(self.key,'ENTER',time.perf_counter())
                 elif key in (8,127): self.stage_action(self.key,'BACKSPACE',time.perf_counter())
                 elif key != 255: self.stage_action(self.key,chr(key),time.perf_counter())
                 if self.state.phase == 'DONE':return 0
+                if current.generation != self.generation: continue
                 value = self.read_terminal()
                 if value is not None:
                     if value.lower() in ('q','stop'):
                         self.quit_home_requested = value.lower() == 'q'
                         raise motion.MotionCancelled('终端退出')
                     if self.state.phase == 'FLOOR' or self.state.phase == 'DISPLAY' and self.floor is None:
-                        if value in ('\n','\r'):self.key('ENTER',time.perf_counter())
-                        elif value in ('\b','\x7f'):self.key('BACKSPACE',time.perf_counter())
+                        if value in ('\n','\r'):value='ENTER'
+                        elif value in ('\b','\x7f'):value='BACKSPACE'
                         elif len(value) > 1:
-                            self.typed = value; self.key('ENTER',time.perf_counter())
-                        else:self.key(value,time.perf_counter())
-                    else: self.stage_action(self.key,value,time.perf_counter())
+                            self.typed = value; value='ENTER'
+                    self.stage_action(self.key,value,time.perf_counter())
                 self.commit_floor_input(time.perf_counter())
                 if self.state.phase == 'DONE':return 0
                 if current.generation != self.generation: continue
+                if self.state.phase == 'GRASP':
+                    self.pick(current)
+                    if current.generation != self.generation: continue
+                if queued_request is not None and self.request is queued_request:
+                    if self.stage_action(self.press, current): continue
+                    if self.request is None:continue
+                    if now-self.request['at'] > self.options['elevator']['floor_wait_s']:
+                        self.log('本次请求定位超时，请重新选择；未使用旧三维目标。'); self.request = None
+                if self.state.phase == 'DISPLAY' and self.ready(now):
+                    if self.floor is not None and display_floor_id(self.last.current_floor) == self.floor:
+                        self.log(f'LCD稳定显示目标楼层 {self.floor}，任务结束后自动回零退出；未判定停车或开门。')
+                        self.home = True; self.state.enter('DONE', now); return 0
+                if self.arrival_deadline is not None and now >= self.arrival_deadline:
+                    self.log('等待到站超时，结束任务并回零退出。'); self.home = True; return 2
+                delta = self.state.tick(now, self.ready(now))
+                if delta == 'HOME':
+                    self.log('三轮均无可靠面板，结束任务并回零退出。'); self.home = True; return 2
+                if delta is not None:
+                    joints = (np.degrees(self.robot._arm_feedback()[0]) if self.robot is not None else self.preview_q)
+                    goal = relative_head_target(joints, delta, self.arm_view_limits(), last_goal_deg=self.preview_q)
+                    if goal is None:
+                        self.log('J2/J3 已无剩余抬头行程，结束搜寻并回零。' if self.robot is not None
+                                 else 'J2/J3 已无剩余抬头行程，结束预览。')
+                        self.home = True; self.state.enter('TIMEOUT', now); return 2
+                    step = goal[1:3] - joints[1:3]
+                    limited = '，本次按限位缩短' if not np.allclose(step, delta, rtol=0., atol=1e-8) else ''
+                    self.log(f'{self.state.timeout_s:g} 秒未找到，再抬头 J2 {step[0]:+.3g}°、J3 {step[1]:+.3g}°'
+                             f'（{self.state.retry_index}/{self.state.RETRY_COUNT}{limited}）。')
+                    self.log(f'目标六轴 deg={goal.tolist()}',verbose_only=True)
+                    phase = self.state.phase
+                    self.stage_action(self.head, goal)
+                    if self.state.phase == phase:self.state.retry_complete(time.perf_counter())
+                    continue
                 kind = self.KINDS.get(self.state.phase)
                 if kind is not None and self.worker.pending is None:
                     self.worker.submit(current,kind=kind)
-        except motion.TrajectoryPlanningError:
-            # The adapter has already stopped/held successfully; the failed
-            # plan never started a sender. Joint-space safe_home does not
-            # repeat IK for the rejected Cartesian target.
+        except (motion.TrajectoryPlanningError,motion.TrajectorySendError,motion.HeadJointLimitError,app.ButtonRefinementError,
+                app.PerceptionError,TimeoutError,CameraFrameError) as exc:
             self.home = True
             self.request = None
             self.skip_requested = False
             self.skip_retreat = self.skip_start_pose = None
             self.skip_position_only = False
-            self.log('IK/轨迹规划失败且本次轨迹未发送；先调用SDK safe_home回零，再失能断开。')
+            self.log('任务中止，尝试回零。')
             raise
         except motion.MotionCancelled:
             self.home = self.quit_home_requested
             if self.home:
-                self.log('Q正常退出：先停止当前指令，再SDK回零并断开。' if self.robot is not None
+                self.log('Q结束任务：停止当前指令，SDK回零后退出。' if self.robot is not None
                          else 'Q退出：未连接机器人，不发送回零动作。')
             else:
-                self.log('已停止；不追加自动回零动作。')
+                self.log('已停止当前动作，退出任务。')
             return 0 if self.quit_home_requested else 130
         finally:
-            active = sys.exc_info()[0] is not None
-            errors = []
-            try:self.restore_terminal()
-            except BaseException as exc:errors.append(f'terminal: {exc}')
-            if self.robot is not None:
-                try: self.robot.close(home=self.home)
-                except BaseException as exc: errors.append(f'robot: {exc}')
-            if self.camera is not None:
-                try: self.camera.close()
-                except BaseException as exc: errors.append(f'camera: {exc}')
-            if self.worker is not None:
-                try: self.worker.close()
-                except BaseException as exc: errors.append(f'worker: {exc}')
-            cv2.destroyAllWindows()
-            if errors:
-                print('[Cleanup] '+'; '.join(errors),file=sys.stderr,flush=True)
-                if not active: raise RuntimeError('; '.join(errors))
+            app.finish_elevator(self.robot,self.camera,self.worker,self.home,restore_terminal=self.restore_terminal)
